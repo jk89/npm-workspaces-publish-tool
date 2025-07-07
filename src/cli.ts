@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { program } from 'commander';
-import { readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { createRequire } from 'module';
 import { dirname, relative, resolve } from 'path';
 import { cwd as getCwd } from 'process';
@@ -16,6 +16,7 @@ import {
     WorkspaceInfo,
 } from 'workspace-tools';
 import { execSync } from 'child_process';
+import { homedir } from 'os';
 
 type Workspace = ReturnType<typeof getWorkspaces>[number];
 type Dependencies = Set<string>;
@@ -587,7 +588,14 @@ function validatePublish() {
             readFileSync(rootPackageJsonPath, 'utf8')
         ) as PackageJson;
         currentRootVersion = rootPackage.version;
-        if (lastMonoRepoTag) {
+
+        // Ensure the root version string itself is valid semver
+        if (!semver.valid(currentRootVersion)) {
+            console.error(
+                `❌ Invalid root version in package.json: "${currentRootVersion}"`
+            );
+            hasError = true;
+        } else if (lastMonoRepoTag) {
             const lastRootPackageRaw = git(
                 ['show', `${lastMonoRepoTag}:package.json`],
                 { cwd }
@@ -597,10 +605,24 @@ function validatePublish() {
                     const lastRootPackage = JSON.parse(
                         lastRootPackageRaw.stdout
                     ) as PackageJson;
-                    previousRootVersion = lastRootPackage.version;
-                    console.log(
-                        `🌳 Root: ${lastRootPackage.version} → ${currentRootVersion}`
-                    );
+                    previousRootVersion = lastRootPackage.version as string;
+
+                    // Ensure the root version has been incremented
+                    if (
+                        !semver.gt(
+                            currentRootVersion as string,
+                            previousRootVersion
+                        )
+                    ) {
+                        console.error(
+                            `❌ Root version not incremented: ${previousRootVersion} → ${currentRootVersion}`
+                        );
+                        hasError = true;
+                    } else {
+                        console.log(
+                            `🌳 Root: ${lastRootPackage.version} → ${currentRootVersion}`
+                        );
+                    }
                 } catch {
                     console.log(
                         `⚠️ Root: ${currentRootVersion} (previous version unavailable)`
@@ -616,7 +638,9 @@ function validatePublish() {
         }
     } catch (e) {
         console.error(
-            `❌ Could not parse root package.json "${rootPackageJsonPath}"`
+            `❌ Could not parse root package.json "${rootPackageJsonPath}"\n${String(
+                (e as Error).stack
+            )}`
         );
         hasError = true;
     }
@@ -699,8 +723,7 @@ function replaceWorkspaceDepsWithVersions(
 
             for (const [depName, currentSpec] of Object.entries<string>(deps)) {
                 if (currentSpec === '*' && packageInfos[depName]) {
-                    const newVersion =
-                        packageInfos[depName].packageJson.version;
+                    const newVersion = packageInfos[depName].version;
                     deps[depName] = newVersion;
                     changed = true;
                     console.log(
@@ -713,7 +736,7 @@ function replaceWorkspaceDepsWithVersions(
         if (changed) {
             writeFileSync(
                 packageJsonPath,
-                JSON.stringify(packageJson, null, 2)
+                JSON.stringify(packageJson, null, 4)
             );
         }
     }
@@ -739,16 +762,38 @@ function restoreWorkspaceDepsToStar(
 function runNpmPublishInReleaseOrder(
     releaseOrder: string[],
     packageInfos: PackageInfos,
-    packagesToRelease: string[]
+    packagesToRelease: string[],
+    registryUrl?: string
 ) {
+    // Determine the registry flag to pass; fallback to ~/.npmrc if no explicit URL
+    let registryFlag = '';
+    if (registryUrl) {
+        registryFlag = ` --registry=${registryUrl}`;
+    } else {
+        const homeNpmrc = `${homedir()}/.npmrc`;
+        if (existsSync(homeNpmrc)) {
+            const lines = readFileSync(homeNpmrc, 'utf8').split(/\r?\n/);
+            const line = lines.find((l) => l.trim().startsWith('registry='));
+            if (line) {
+                const url = line.split('=')[1].trim();
+                registryFlag = ` --registry=${url}`;
+            }
+        }
+    }
+
     for (const packageName of releaseOrder) {
         if (!packagesToRelease.includes(packageName)) continue;
 
         const pkgInfo = packageInfos[packageName];
         const pkgDir = dirname(pkgInfo.packageJsonPath);
-        console.log(`\n📦 Publishing ${packageName} from ${pkgDir}...`);
+        console.log(
+            `\n📦 Publishing ${packageName} from ${pkgDir} to ${
+                registryUrl || 'default registry'
+            }...`
+        );
+
         try {
-            execSync('npm publish', {
+            execSync(`npm publish${registryFlag}`, {
                 cwd: pkgDir,
                 stdio: 'inherit',
                 env: { ...process.env, FORCE_COLOR: '1' },
@@ -791,6 +836,7 @@ program.name(pkg.name).description(pkg.description).version(pkg.version);
 program
     .description('Publish packages')
     .option('--dry-run', 'Run without making changes')
+    .option('--registry <url>', 'NPM registry to publish to')
     .action((options) => {
         printHeader();
         const {
@@ -800,6 +846,7 @@ program
             currentRootVersion,
         } = validatePublish();
         const dryRun = options.dryRun;
+        const registryUrl = options.registry;
 
         if (packagesToRelease.length === 0) {
             return console.log(' ￣\\_(ツ)_/￣ No workspaces to publish');
@@ -827,7 +874,8 @@ program
                 runNpmPublishInReleaseOrder(
                     releaseOrder,
                     packageInfos,
-                    packagesToRelease
+                    packagesToRelease,
+                    registryUrl
                 );
                 console.log('\n🎉 All packages published successfully!');
                 console.log(

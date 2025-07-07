@@ -23,12 +23,13 @@ npm install -g npm-workspaces-publish-tool
 ## Usage
 
 ```bash
-nw-publish [--dry-run]
+nw-publish [--dry-run] [--registry <url>]
 ```
 
 ### Command Options
 
 - `--dry-run`: Runs validation and preview without actual publishing
+- `--registry <url>`: (Optional) NPM registry URL to publish scoped packages to
 
 ## Workflow
 1. **Validation Phase**
