@@ -53,9 +53,9 @@ function calculateWorkspaceInDegree(
         inDegree.set(pkgName, 0);
     }
 
-    for (const [_, deps] of dependencies) {
-        for (const dep of deps) {
-            inDegree.set(dep, (inDegree.get(dep) ?? 0) + 1);
+    for (const [pkgName, deps] of dependencies) {
+        for (const _ of deps) {
+            inDegree.set(pkgName, (inDegree.get(pkgName) ?? 0) + 1);
         }
     }
 
@@ -76,12 +76,12 @@ function getReleaseOrderFromInDegree(
         const current = queue.shift() as string;
         order.push(current);
 
-        if (dependencies.has(current)) {
-            for (const dependent of dependencies.get(current) as Dependencies) {
-                const newCount = (inDegree.get(dependent) as number) - 1;
-                inDegree.set(dependent, newCount);
+        for (const [pkg, deps] of dependencies) {
+            if (deps.has(current)) {
+                const newCount = (inDegree.get(pkg) as number) - 1;
+                inDegree.set(pkg, newCount);
                 if (newCount === 0) {
-                    queue.push(dependent);
+                    queue.push(pkg);
                 }
             }
         }
