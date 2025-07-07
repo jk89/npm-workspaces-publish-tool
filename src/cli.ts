@@ -93,7 +93,8 @@ function getReleaseOrderFromInDegree(
 
 function getDirtyMap(
     workspaces: ReturnType<typeof getWorkspaces>,
-    lastTag: string | null
+    lastTag: string | null,
+    cwd: string,
 ): Map<string, DirtyStatus> {
     const dirtyMap = new Map<string, DirtyStatus>();
 
@@ -103,9 +104,7 @@ function getDirtyMap(
 
     for (const ws of workspaces) {
         const isNew = !lastTag;
-        const isDirty = changedFiles.some(
-            (f) => f.startsWith(ws.path + '/') || f === ws.path
-        );
+        const isDirty = changedFiles.some((f) => resolve(cwd,f).includes(ws.path));
 
         if (isNew) {
             dirtyMap.set(ws.name, 'new');
@@ -196,8 +195,10 @@ function getDirtyPackagesVersionChanges(
             continue;
         }
 
+        const relativeWsPath = relative(cwd, ws.path);
+
         const previousPkgRaw = git(
-            ['show', `${lastTag}:${ws.path}/package.json`],
+            ['show', `${lastTag}:${relativeWsPath}/package.json`],
             {
                 cwd,
             }
@@ -501,7 +502,7 @@ function validatePublish() {
     const { dependencies } = createDependencyMap(packageInfos);
     const inDegree = calculateWorkspaceInDegree(workspaces, dependencies);
     const releaseOrder = getReleaseOrderFromInDegree(inDegree, dependencies);
-    const dirtyMap = getDirtyMap(workspaces, lastMonoRepoTag);
+    const dirtyMap = getDirtyMap(workspaces, lastMonoRepoTag, cwd);
     const dirtyVersionChanges = getDirtyPackagesVersionChanges(
         workspaces,
         dirtyMap,
