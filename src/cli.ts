@@ -13,6 +13,7 @@ import {
     getWorkspaces,
     git,
     PackageInfos,
+    WorkspaceInfo,
 } from 'workspace-tools';
 import { execSync } from 'child_process';
 
@@ -43,12 +44,12 @@ function getLastTag(cwd: string): string | null {
 }
 
 function calculateWorkspaceInDegree(
-    packageInfos: PackageInfos,
+    workspaces: WorkspaceInfo,
     dependencies: Map<string, Set<string>>
 ) {
     const inDegree = new Map<string, number>();
 
-    for (const pkgName of Object.keys(packageInfos)) {
+    for (const pkgName of workspaces.map((workspace) => workspace.name)) {
         inDegree.set(pkgName, 0);
     }
 
@@ -196,7 +197,9 @@ function getDirtyPackagesVersionChanges(
 
         const previousPkgRaw = git(
             ['show', `${lastTag}:${ws.path}/package.json`],
-            { cwd }
+            {
+                cwd,
+            }
         );
 
         if (!previousPkgRaw.success) {
@@ -495,7 +498,7 @@ function validatePublish() {
     const workspaces = getWorkspaces(cwd);
     const packageInfos = getPackageInfos(cwd);
     const { dependencies } = createDependencyMap(packageInfos);
-    const inDegree = calculateWorkspaceInDegree(packageInfos, dependencies);
+    const inDegree = calculateWorkspaceInDegree(workspaces, dependencies);
     const releaseOrder = getReleaseOrderFromInDegree(inDegree, dependencies);
     const dirtyMap = getDirtyMap(workspaces, lastMonoRepoTag);
     const dirtyVersionChanges = getDirtyPackagesVersionChanges(
@@ -524,10 +527,11 @@ function validatePublish() {
         }
     }
 
-    console.log('#️⃣  Validating versions...\n');
+    console.log('\n#️⃣  Validating versions...\n');
 
     let hasError = false;
 
+    // Validate workspace versions
     for (const [
         pkgName,
         { oldVersion, newVersion, versionChanged, versionIncremented },
@@ -574,18 +578,69 @@ function validatePublish() {
         }
     }
 
+    // Validate root workspace
+    const rootPackageJsonPath = resolve(cwd, 'package.json');
+    let previousRootVersion: string | undefined;
+    let currentRootVersion: string | undefined;
+    try {
+        const rootPackage = JSON.parse(
+            readFileSync(rootPackageJsonPath, 'utf8')
+        ) as PackageJson;
+        currentRootVersion = rootPackage.version;
+        if (lastMonoRepoTag) {
+            const lastRootPackageRaw = git(
+                ['show', `${lastMonoRepoTag}:package.json`],
+                { cwd }
+            );
+            if (lastRootPackageRaw.success) {
+                try {
+                    const lastRootPackage = JSON.parse(
+                        lastRootPackageRaw.stdout
+                    ) as PackageJson;
+                    previousRootVersion = lastRootPackage.version;
+                    console.log(
+                        `🌳 Root: ${lastRootPackage.version} → ${currentRootVersion}`
+                    );
+                } catch {
+                    console.log(
+                        `⚠️ Root: ${currentRootVersion} (previous version unavailable)`
+                    );
+                }
+            } else {
+                console.log(
+                    `⚠️ Root: ${currentRootVersion} (previous version unavailable)`
+                );
+            }
+        } else {
+            console.log(`🌳 Root: ${currentRootVersion} (first release)`);
+        }
+    } catch (e) {
+        console.error(
+            `❌ Could not parse root package.json "${rootPackageJsonPath}"`
+        );
+        hasError = true;
+    }
+
     if (hasError) {
         console.error('\nFix the above issues before publishing.\n');
         process.exit(1);
     }
 
-    console.log('🗃️  Validating git status...\n');
+    console.log('\n🗃️  Validating git status...\n');
 
     if (!verifyCleanGitStatus(workspaces, dirtyMap, cwd)) {
         process.exit(1);
     }
 
     console.log('📝 Publish summary:\n');
+
+    if (previousRootVersion) {
+        console.log(`🌳 Root: ${previousRootVersion} → ${currentRootVersion}`);
+    } else {
+        console.log(`🌳 Root: ${currentRootVersion} (first release)`);
+    }
+    console.log('');
+
     const packagesToRelease: string[] = [];
 
     for (const pkgName of releaseOrder) {
@@ -615,7 +670,12 @@ function validatePublish() {
         }
     }
 
-    return { releaseOrder, packageInfos, packagesToRelease };
+    return {
+        releaseOrder,
+        packageInfos,
+        packagesToRelease,
+        currentRootVersion: currentRootVersion as string,
+    };
 }
 
 function replaceWorkspaceDepsWithVersions(
@@ -701,6 +761,17 @@ function runNpmPublishInReleaseOrder(
     }
 }
 
+function tagAndPushRepo(version: string) {
+    try {
+        execSync(`git tag v${version}`, { stdio: 'inherit' });
+        execSync(`git push origin v${version}`, { stdio: 'inherit' });
+        console.log(`✅ Tagged and pushed v${version}`);
+    } catch (err) {
+        console.error(`❌ Failed to tag or push v${version}:`, err);
+        process.exit(1);
+    }
+}
+
 function printHeader() {
     console.log(`
                              _    _  _      _   
@@ -722,13 +793,16 @@ program
     .option('--dry-run', 'Run without making changes')
     .action((options) => {
         printHeader();
-        const { packageInfos, releaseOrder, packagesToRelease } =
-            validatePublish();
+        const {
+            packageInfos,
+            releaseOrder,
+            packagesToRelease,
+            currentRootVersion,
+        } = validatePublish();
         const dryRun = options.dryRun;
 
         if (packagesToRelease.length === 0) {
-            console.log(' ￣\\_(ツ)_/￣ No packages to publish');
-            return;
+            return console.log(' ￣\\_(ツ)_/￣ No workspaces to publish');
         }
 
         let originalPackageJsons: Map<string, string> | null = null;
@@ -756,9 +830,16 @@ program
                     packagesToRelease
                 );
                 console.log('\n🎉 All packages published successfully!');
+                console.log(
+                    `\n🏷️ Tagging repository with v${currentRootVersion}...`
+                );
+                tagAndPushRepo(currentRootVersion);
             } else {
                 console.log('\n[dry-run] 📦 Would publish packages in order:');
                 packagesToRelease.forEach((pkg) => console.log(`- ${pkg}`));
+                console.log(
+                    `\n[dry-run] 🏷️  Would tag repository with v${currentRootVersion}...`
+                );
             }
         } catch (error) {
             console.error('\n ❌ Publishing failed:', error);
