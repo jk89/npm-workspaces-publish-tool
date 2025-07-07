@@ -1,6 +1,6 @@
 {
     "name": "npm-workspaces-publish-tool",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "description": "An unopinionated tool to assist publishing of npm based mono-repo workspaces",
     "main": "build/src/cli.js",
     "type": "module",
