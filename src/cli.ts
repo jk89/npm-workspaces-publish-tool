@@ -584,6 +584,7 @@ function validatePublish() {
     const rootPackageJsonPath = resolve(cwd, 'package.json');
     let previousRootVersion: string | undefined;
     let currentRootVersion: string | undefined;
+    let rootPackageSuccessMessage: string | undefined;
     try {
         const rootPackage = JSON.parse(
             readFileSync(rootPackageJsonPath, 'utf8')
@@ -620,22 +621,16 @@ function validatePublish() {
                         );
                         hasError = true;
                     } else {
-                        console.log(
-                            `🌳 Root: ${lastRootPackage.version} → ${currentRootVersion}`
-                        );
+                        rootPackageSuccessMessage = `🌳 Root: ${lastRootPackage.version} → ${currentRootVersion}`;
                     }
                 } catch {
-                    console.log(
-                        `⚠️ Root: ${currentRootVersion} (previous version unavailable)`
-                    );
+                        rootPackageSuccessMessage =`⚠️ Root: ${currentRootVersion} (previous version unavailable)`
                 }
             } else {
-                console.log(
-                    `⚠️ Root: ${currentRootVersion} (previous version unavailable)`
-                );
+                    rootPackageSuccessMessage = `⚠️ Root: ${currentRootVersion} (previous version unavailable)`
             }
         } else {
-            console.log(`🌳 Root: ${currentRootVersion} (first release)`);
+            rootPackageSuccessMessage = `🌳 Root: ${currentRootVersion} (first release)`;
         }
     } catch (e) {
         console.error(
@@ -650,6 +645,8 @@ function validatePublish() {
         console.error('\nFix the above issues before publishing.\n');
         process.exit(1);
     }
+
+    console.log(rootPackageSuccessMessage);
 
     console.log('\n🗃️  Validating git status...\n');
 
