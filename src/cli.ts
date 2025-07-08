@@ -98,9 +98,16 @@ function getDirtyMap(
 ): Map<string, DirtyStatus> {
     const dirtyMap = new Map<string, DirtyStatus>();
 
-    const changedFiles = lastTag
+    const changedFilesFromTag = lastTag
         ? getChangesBetweenRefs(lastTag, 'HEAD', [], '', cwd)
         : [];
+
+    const changedFilesLocal = git(['diff', '--name-only', 'HEAD'], { cwd })
+        .stdout.trim()
+        .split('\n')
+        .filter(Boolean);
+
+    const changedFiles = [...changedFilesFromTag, ...changedFilesLocal];
 
     for (const ws of workspaces) {
         const isNew = !lastTag;
@@ -646,8 +653,6 @@ function validatePublish() {
         process.exit(1);
     }
 
-    console.log(rootPackageSuccessMessage);
-
     console.log('\n🗃️  Validating git status...\n');
 
     if (!verifyCleanGitStatus(workspaces, dirtyMap, cwd)) {
@@ -656,11 +661,7 @@ function validatePublish() {
 
     console.log('📝 Publish summary:\n');
 
-    if (previousRootVersion) {
-        console.log(`🌳 Root: ${previousRootVersion} → ${currentRootVersion}`);
-    } else {
-        console.log(`🌳 Root: ${currentRootVersion} (first release)`);
-    }
+    console.log(rootPackageSuccessMessage);
     console.log('');
 
     const packagesToRelease: string[] = [];
