@@ -711,7 +711,7 @@ function replaceWorkspaceDepsWithVersions(
         const packageJsonPath = pkgInfo.packageJsonPath;
         const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
 
-        originals.set(pkgName, JSON.stringify(packageJson));
+        originals.set(pkgName, JSON.stringify(packageJson, null, 4));
 
         let changed = false;
 
