@@ -94,7 +94,7 @@ function getReleaseOrderFromInDegree(
 function getDirtyMap(
     workspaces: ReturnType<typeof getWorkspaces>,
     lastTag: string | null,
-    cwd: string,
+    cwd: string
 ): Map<string, DirtyStatus> {
     const dirtyMap = new Map<string, DirtyStatus>();
 
@@ -111,7 +111,9 @@ function getDirtyMap(
 
     for (const ws of workspaces) {
         const isNew = !lastTag;
-        const isDirty = changedFiles.some((f) => resolve(cwd,f).includes(ws.path));
+        const isDirty = changedFiles.some((f) =>
+            resolve(cwd, f).includes(ws.path)
+        );
 
         if (isNew) {
             dirtyMap.set(ws.name, 'new');
@@ -508,7 +510,7 @@ function validatePublish() {
     const packageInfos = getPackageInfos(cwd);
     const { dependencies } = createDependencyMap(packageInfos);
     const inDegree = calculateWorkspaceInDegree(workspaces, dependencies);
-    const releaseOrder = getReleaseOrderFromInDegree(inDegree, dependencies);
+    const releaseOrderOriginal = getReleaseOrderFromInDegree(inDegree, dependencies);
     const dirtyMap = getDirtyMap(workspaces, lastMonoRepoTag, cwd);
     const dirtyVersionChanges = getDirtyPackagesVersionChanges(
         workspaces,
@@ -516,6 +518,20 @@ function validatePublish() {
         lastMonoRepoTag,
         cwd
     );
+
+    const releaseOrder = releaseOrderOriginal.filter((pkgName) => {
+        const ws = packageInfos[pkgName];
+        const isRoot = workspaces.some(
+            (w) => w.path === '.' && w.name === pkgName
+        ); // root detection
+        const isPrivate = ws?.private;
+
+        if (!isRoot && isPrivate) {
+            console.log(`⚠️ Wont publish private workspace: ${pkgName}`);
+        }
+
+        return isRoot || !isPrivate; // Keep root, skip other private packages
+    });
 
     console.log('🏗️  Building packages...');
     for (const pkgName of releaseOrder) {
@@ -631,10 +647,10 @@ function validatePublish() {
                         rootPackageSuccessMessage = `🌳 Root: ${lastRootPackage.version} → ${currentRootVersion}`;
                     }
                 } catch {
-                        rootPackageSuccessMessage =`⚠️ Root: ${currentRootVersion} (previous version unavailable)`
+                    rootPackageSuccessMessage = `⚠️ Root: ${currentRootVersion} (previous version unavailable)`;
                 }
             } else {
-                    rootPackageSuccessMessage = `⚠️ Root: ${currentRootVersion} (previous version unavailable)`
+                rootPackageSuccessMessage = `⚠️ Root: ${currentRootVersion} (previous version unavailable)`;
             }
         } else {
             rootPackageSuccessMessage = `🌳 Root: ${currentRootVersion} (first release)`;
