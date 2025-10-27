@@ -540,7 +540,6 @@ function verifyCleanGitStatus(
     return true;
 }
 
-
 function readPackageJsonSync(path: string): PackageJson | null {
     try {
         return JSON.parse(readFileSync(path, 'utf8')) as PackageJson;
@@ -766,9 +765,17 @@ function computeWorkspaceValidation(
                 .split('\n')
                 .filter(Boolean);
 
+            const stagedChanges = git(
+                ['diff', '--cached', '--name-only', ws.path],
+                { cwd }
+            )
+                .stdout.trim()
+                .split('\n')
+                .filter(Boolean);
+
             // Merge and deduplicate
             const allChanges = Array.from(
-                new Set([...changedFiles, ...localChanges])
+                new Set([...changedFiles, ...localChanges, ...stagedChanges])
             );
 
             if (allChanges.length > 0) {
