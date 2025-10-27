@@ -291,7 +291,9 @@ function checkForUnpushedCommits(cwd: string) {
 function verifyCleanGitStatus(
     workspaces: { name: string; path: string }[],
     dirtyMap: Map<string, 'new' | 'dirty' | 'unchanged'>,
-    cwd: string
+    cwd: string,
+    dryRun: boolean,
+    autoTick: boolean
 ): boolean {
     const changedFilesRaw = git(['diff', '--name-only', 'HEAD'], { cwd })
         .stdout.trim()
@@ -490,6 +492,39 @@ function verifyCleanGitStatus(
         }
     }
 
+    // Detect previous dry-run auto-tick commit
+    let allowPreviousDryRunAutoTick = false;
+    if (autoTick && dryRun) {
+        const upstreamResult = git(['rev-parse', '--abbrev-ref', '@{u}'], {
+            cwd,
+        });
+        if (upstreamResult.success) {
+            const upstream = upstreamResult.stdout.trim();
+            const unpushedRaw = git(
+                ['log', `${upstream}..HEAD`, '--pretty=%B%n==END=='],
+                { cwd }
+            );
+            if (unpushedRaw.success && unpushedRaw.stdout.trim()) {
+                const msgs = unpushedRaw.stdout
+                    .split('==END==')
+                    .map((s) => s.trim())
+                    .filter(Boolean);
+                const isAutoTick = (msg: string) =>
+                    msg.split('\n', 1)[0].trim() ===
+                    'CHORE: Auto tick stale versions';
+                allowPreviousDryRunAutoTick = msgs.some(isAutoTick);
+            }
+        }
+    }
+
+    const noUnpushedCommits = checkForUnpushedCommits(cwd);
+
+    if (allowPreviousDryRunAutoTick) {
+        console.log(
+            'ℹ️ Previous dry-run auto-tick commit detected (exactly "CHORE: Auto tick stale versions"); temporarily permitting unpushed commits—including any staged changes—to exist without failing validation because the next full-mode run will push them automatically. All other critical issues (untracked files, dirty workspaces, stale versions) are still enforced and will cause failure if violated.'
+        );
+    }
+
     if (hasCriticalIssues) {
         console.error(
             'Please commit or stash the above changes before publishing.'
@@ -497,20 +532,24 @@ function verifyCleanGitStatus(
         return false;
     }
 
-    if (!checkForUnpushedCommits(cwd)) {
-        return false;
+    // Only check for unpushed commits if no dry-run auto-tick exists
+    if (!allowPreviousDryRunAutoTick) {
+        if (!noUnpushedCommits) return false;
     }
 
     return true;
 }
 
-function validatePublish() {
+function validatePublish(dryRun: boolean, autoTick: boolean) {
     const lastMonoRepoTag = getLastTag(cwd);
     const workspaces = getWorkspaces(cwd);
     const packageInfos = getPackageInfos(cwd);
     const { dependencies } = createDependencyMap(packageInfos);
     const inDegree = calculateWorkspaceInDegree(workspaces, dependencies);
-    const releaseOrderOriginal = getReleaseOrderFromInDegree(inDegree, dependencies);
+    const releaseOrderOriginal = getReleaseOrderFromInDegree(
+        inDegree,
+        dependencies
+    );
     const dirtyMap = getDirtyMap(workspaces, lastMonoRepoTag, cwd);
     const dirtyVersionChanges = getDirtyPackagesVersionChanges(
         workspaces,
@@ -555,6 +594,7 @@ function validatePublish() {
     console.log('\n#️⃣  Validating versions...\n');
 
     let hasError = false;
+    let staleVersion = false;
 
     // Validate workspace versions
     for (const [
@@ -573,7 +613,7 @@ function validatePublish() {
             console.error(
                 `❌ Package "${pkgName}" was modified but version unchanged (${newVersion})`
             );
-            hasError = true;
+            staleVersion = true;
 
             const ws = workspaces.find((w) => w.name === pkgName) as Workspace;
             const changedFiles = lastMonoRepoTag
@@ -599,7 +639,7 @@ function validatePublish() {
             console.error(
                 `❌ Package "${pkgName}" version not incremented: ${oldVersion} -> ${newVersion}`
             );
-            hasError = true;
+            staleVersion = true;
         }
     }
 
@@ -642,7 +682,7 @@ function validatePublish() {
                         console.error(
                             `❌ Root version not incremented: ${previousRootVersion} → ${currentRootVersion}`
                         );
-                        hasError = true;
+                        staleVersion = true;
                     } else {
                         rootPackageSuccessMessage = `🌳 Root: ${lastRootPackage.version} → ${currentRootVersion}`;
                     }
@@ -664,14 +704,128 @@ function validatePublish() {
         hasError = true;
     }
 
-    if (hasError) {
+    if (hasError || (staleVersion && !autoTick)) {
         console.error('\nFix the above issues before publishing.\n');
         process.exit(1);
     }
 
+    // Auto tick feature -----------------------------------------------------------------------------------------------
+
+    // If we previously ran with dry_run mode and auto tick but this time we run in dry_run mode we may have unpushed commits due to the auto tick
+    // in this case we need to push them otherwise verifyCleanGitStatus will fail
+
+    if (!dryRun) {
+        const upstreamResult = git(['rev-parse', '--abbrev-ref', '@{u}'], {
+            cwd,
+        });
+        if (upstreamResult.success) {
+            const upstream = upstreamResult.stdout.trim();
+
+            const unpushedRaw = git(
+                ['log', `${upstream}..HEAD`, '--pretty=%B%n==END=='],
+                { cwd }
+            );
+            if (unpushedRaw.success && unpushedRaw.stdout.trim()) {
+                const msgs = unpushedRaw.stdout
+                    .split('==END==')
+                    .map((s) => s.trim())
+                    .filter(Boolean);
+
+                // Exact-match: first line must equal this string
+                const isAutoTick = (msg: string) =>
+                    msg.split('\n', 1)[0].trim() ===
+                    'CHORE: Auto tick stale versions';
+
+                // PUSH if *any* unpushed commit is an auto-tick commit
+                const allAutoTick = msgs.length > 0 && msgs.some(isAutoTick);
+
+                if (allAutoTick) {
+                    console.log(
+                        '⬆️ Found only auto-tick unpushed commit(s); pushing them to upstream...'
+                    );
+                    execSync('git push', { cwd, stdio: 'inherit' });
+                } else {
+                    console.log(
+                        'ℹ️ Unpushed commits exist and are not all exact-match auto-tick; not pushing here.'
+                    );
+                }
+            }
+        }
+    }
+
+    // If we have stale versions we can use 'npm version patch --no-git-tag-version --force' to bump each individual one
+    // We should then commit them all and the root package lock
+    // In dry_run mode we should NOT push in normal mode we should.
+
+    if (autoTick && staleVersion) {
+        console.log('\n🔧 Auto-ticking packages with stale versions...');
+
+        const filesToCommit: string[] = [];
+
+        // Auto-tick workspaces
+        for (const [pkgName, versionInfo] of dirtyVersionChanges.entries()) {
+            if (!versionInfo.versionChanged) {
+                const ws = workspaces.find(
+                    (w) => w.name === pkgName
+                ) as Workspace;
+                const pkgDir = resolve(cwd, ws.path);
+
+                console.log(`⬆️ Auto-ticking ${pkgName}`);
+                execSync(`npm version patch --no-git-tag-version --force`, {
+                    cwd: pkgDir,
+                    stdio: 'inherit',
+                    env: { ...process.env, FORCE_COLOR: '1' },
+                });
+
+                const updatedPkg = JSON.parse(
+                    readFileSync(resolve(pkgDir, 'package.json'), 'utf8')
+                );
+                versionInfo.newVersion = updatedPkg.version;
+                versionInfo.versionChanged = true;
+                versionInfo.versionIncremented = true;
+
+                filesToCommit.push(resolve(pkgDir, 'package.json'));
+            }
+        }
+
+        // Auto-tick root package
+        const rootPkgPath = resolve(cwd, 'package.json');
+        const rootLockFile = resolve(cwd, 'package-lock.json');
+
+        console.log(`⬆️ Auto-ticking root package`);
+        execSync(`npm version patch --no-git-tag-version --force`, {
+            cwd,
+            stdio: 'inherit',
+            env: { ...process.env, FORCE_COLOR: '1' },
+        });
+        filesToCommit.push(rootPkgPath);
+        if (existsSync(rootLockFile)) filesToCommit.push(rootLockFile);
+
+        // Commit auto-ticked files locally
+        if (filesToCommit.length > 0) {
+            execSync(
+                `git add ${filesToCommit.map((f) => `"${f}"`).join(' ')}`,
+                { cwd, stdio: 'inherit' }
+            );
+            execSync(`git commit -m "CHORE: Auto tick stale versions"`, {
+                cwd,
+                stdio: 'inherit',
+            });
+
+            if (!dryRun) {
+                console.log('⬆️ Pushing auto-ticked commits to remote...');
+                execSync(`git push`, { cwd, stdio: 'inherit' });
+            } else {
+                console.log(
+                    '[dry-run] ✅ Auto-tick committed locally; did not push'
+                );
+            }
+        }
+    }
+
     console.log('\n🗃️  Validating git status...\n');
 
-    if (!verifyCleanGitStatus(workspaces, dirtyMap, cwd)) {
+    if (!verifyCleanGitStatus(workspaces, dirtyMap, cwd, dryRun, autoTick)) {
         process.exit(1);
     }
 
@@ -852,16 +1006,24 @@ program
     .description('Publish packages')
     .option('--dry-run', 'Run without making changes')
     .option('--registry <url>', 'NPM registry to publish to')
+    // add an option for --auto-tick which will automatically tick and push the package.json versions if they need it, but only push to remote if not in dry-run mode.
+    .option(
+        '--auto-tick',
+        'Automatically tick patch versions in the workspace/root package.json files if needed prior to a release'
+    )
     .action((options) => {
         printHeader();
+
+        const dryRun = options.dryRun;
+        const registryUrl = options.registry;
+        const autoTick = options.autoTick;
+
         const {
             packageInfos,
             releaseOrder,
             packagesToRelease,
             currentRootVersion,
-        } = validatePublish();
-        const dryRun = options.dryRun;
-        const registryUrl = options.registry;
+        } = validatePublish(dryRun, autoTick);
 
         if (packagesToRelease.length === 0) {
             return console.log(' ￣\\_(ツ)_/￣ No workspaces to publish');
