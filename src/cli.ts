@@ -540,121 +540,94 @@ function verifyCleanGitStatus(
     return true;
 }
 
-function validatePublish(dryRun: boolean, autoTick: boolean) {
-    const lastMonoRepoTag = getLastTag(cwd);
-    const workspaces = getWorkspaces(cwd);
-    const packageInfos = getPackageInfos(cwd);
-    const { dependencies } = createDependencyMap(packageInfos);
-    const inDegree = calculateWorkspaceInDegree(workspaces, dependencies);
-    const releaseOrderOriginal = getReleaseOrderFromInDegree(
-        inDegree,
-        dependencies
-    );
-    const dirtyMap = getDirtyMap(workspaces, lastMonoRepoTag, cwd);
-    const dirtyVersionChanges = getDirtyPackagesVersionChanges(
+
+function readPackageJsonSync(path: string): PackageJson | null {
+    try {
+        return JSON.parse(readFileSync(path, 'utf8')) as PackageJson;
+    } catch {
+        return null;
+    }
+}
+
+function writePackageJsonSync(path: string, pkg: PackageJson) {
+    writeFileSync(path, JSON.stringify(pkg, null, 4) + '\n', 'utf8');
+}
+
+function bumpPatchVersion(pkgDir: string) {
+    execSync(`npm version patch --no-git-tag-version --force`, {
+        cwd: pkgDir,
+        stdio: 'inherit',
+        env: { ...process.env, FORCE_COLOR: '1' },
+    });
+}
+
+function gitAddCommitPush(files: string[], cwdArg: string, dryRun: boolean) {
+    if (files.length === 0) return;
+    execSync(`git add ${files.map((f) => `"${f}"`).join(' ')}`, {
+        cwd: cwdArg,
+        stdio: 'inherit',
+    });
+    execSync(`git commit -m "CHORE: Auto tick stale versions"`, {
+        cwd: cwdArg,
+        stdio: 'inherit',
+    });
+    if (!dryRun) {
+        execSync(`git push`, { cwd: cwdArg, stdio: 'inherit' });
+    }
+}
+
+function recomputeDirtyVersionChangesAfterAutoTick(
+    workspaces: ReturnType<typeof getWorkspaces>,
+    dirtyMap: Map<string, DirtyStatus>,
+    lastMonoRepoTag: string | null,
+    cwdArg: string,
+    targetMap: Map<
+        string,
+        {
+            oldVersion: string | null;
+            newVersion: string;
+            versionChanged: boolean;
+            versionIncremented: boolean;
+        }
+    >
+) {
+    const refreshed = getDirtyPackagesVersionChanges(
         workspaces,
         dirtyMap,
         lastMonoRepoTag,
-        cwd
+        cwdArg
     );
-
-    const releaseOrder = releaseOrderOriginal.filter((pkgName) => {
-        const ws = packageInfos[pkgName];
-        const isRoot = workspaces.some(
-            (w) => w.path === '.' && w.name === pkgName
-        ); // root detection
-        const isPrivate = ws?.private;
-
-        if (!isRoot && isPrivate) {
-            console.log(`⚠️ Wont publish private workspace: ${pkgName}`);
-        }
-
-        return isRoot || !isPrivate; // Keep root, skip other private packages
-    });
-
-    console.log('🏗️  Building packages...');
-    for (const pkgName of releaseOrder) {
-        const pkgInfo = packageInfos[pkgName];
-        if (!pkgInfo.scripts?.build) continue;
-
-        const pkgDir = dirname(pkgInfo.packageJsonPath);
-        console.log(`\n🏗️  Building ${pkgName}...`);
-        try {
-            execSync('npm run build', {
-                cwd: pkgDir,
-                stdio: 'inherit',
-                env: { ...process.env, FORCE_COLOR: '1' },
-            });
-        } catch (error) {
-            console.error(`❌ Build failed for ${pkgName}:`, error);
-            process.exit(1);
-        }
+    targetMap.clear();
+    for (const [k, v] of refreshed.entries()) {
+        targetMap.set(k, v);
     }
+}
 
-    console.log('\n#️⃣  Validating versions...\n');
-
-    let hasError = false;
-    let staleVersion = false;
-
-    // Validate workspace versions
-    for (const [
-        pkgName,
-        { oldVersion, newVersion, versionChanged, versionIncremented },
-    ] of dirtyVersionChanges.entries()) {
-        if (!semver.valid(newVersion)) {
-            console.error(
-                `❌ Package "${pkgName}" has invalid version: "${newVersion}"`
-            );
-            hasError = true;
-            continue;
-        }
-
-        if (!versionChanged) {
-            console.error(
-                `❌ Package "${pkgName}" was modified but version unchanged (${newVersion})`
-            );
-            staleVersion = true;
-
-            const ws = workspaces.find((w) => w.name === pkgName) as Workspace;
-            const changedFiles = lastMonoRepoTag
-                ? getChangesBetweenRefs(
-                      lastMonoRepoTag,
-                      'HEAD',
-                      [],
-                      ws.path,
-                      cwd
-                  )
-                : [];
-
-            if (changedFiles.length > 0) {
-                console.error(`   Changed files in "${pkgName}":`);
-                for (const file of changedFiles) {
-                    console.error(`     - ${relative(ws.path, file)}`);
-                }
-            }
-            continue;
-        }
-
-        if (oldVersion && !versionIncremented) {
-            console.error(
-                `❌ Package "${pkgName}" version not incremented: ${oldVersion} -> ${newVersion}`
-            );
-            staleVersion = true;
-        }
-    }
-
-    // Validate root workspace
-    const rootPackageJsonPath = resolve(cwd, 'package.json');
+function validateRootVersionBlock(
+    lastMonoRepoTag: string | null,
+    cwdArg: string,
+    workspaces: ReturnType<typeof getWorkspaces>,
+    dirtyMap: Map<string, DirtyStatus>
+): {
+    currentRootVersion?: string;
+    previousRootVersion?: string;
+    rootPackageSuccessMessage?: string;
+    hasError: boolean;
+    staleVersion: boolean;
+} {
+    const rootPackageJsonPath = resolve(cwdArg, 'package.json');
     let previousRootVersion: string | undefined;
     let currentRootVersion: string | undefined;
     let rootPackageSuccessMessage: string | undefined;
-    try {
-        const rootPackage = JSON.parse(
-            readFileSync(rootPackageJsonPath, 'utf8')
-        ) as PackageJson;
-        currentRootVersion = rootPackage.version;
+    let hasError = false;
+    let staleVersion = false;
 
-        // Ensure the root version string itself is valid semver
+    try {
+        const rootPackage = readPackageJsonSync(
+            rootPackageJsonPath
+        ) as PackageJson;
+        currentRootVersion = rootPackage?.version;
+
         if (!semver.valid(currentRootVersion)) {
             console.error(
                 `❌ Invalid root version in package.json: "${currentRootVersion}"`
@@ -663,7 +636,7 @@ function validatePublish(dryRun: boolean, autoTick: boolean) {
         } else if (lastMonoRepoTag) {
             const lastRootPackageRaw = git(
                 ['show', `${lastMonoRepoTag}:package.json`],
-                { cwd }
+                { cwd: cwdArg }
             );
             if (lastRootPackageRaw.success) {
                 try {
@@ -672,19 +645,31 @@ function validatePublish(dryRun: boolean, autoTick: boolean) {
                     ) as PackageJson;
                     previousRootVersion = lastRootPackage.version as string;
 
-                    // Ensure the root version has been incremented
+                    const anyWorkspaceDirty = workspaces.some(
+                        (ws) => dirtyMap.get(ws.name) !== 'unchanged'
+                    );
+
                     if (
                         !semver.gt(
                             currentRootVersion as string,
                             previousRootVersion
                         )
                     ) {
-                        console.error(
-                            `❌ Root version not incremented: ${previousRootVersion} → ${currentRootVersion}`
-                        );
-                        staleVersion = true;
+                        if (
+                            workspaces.some(
+                                (ws) => dirtyMap.get(ws.name) !== 'unchanged'
+                            )
+                        ) {
+                            console.error(
+                                `❌ Root version not incremented: ${previousRootVersion} → ${currentRootVersion}`
+                            );
+                            staleVersion = true;
+                        } else {
+                            // nothing changed, so root is effectively unchanged
+                            rootPackageSuccessMessage = `✔️ Root: ${currentRootVersion} (unchanged)`;
+                        }
                     } else {
-                        rootPackageSuccessMessage = `🌳 Root: ${lastRootPackage.version} → ${currentRootVersion}`;
+                        rootPackageSuccessMessage = `🌳 Root: ${previousRootVersion} → ${currentRootVersion}`;
                     }
                 } catch {
                     rootPackageSuccessMessage = `⚠️ Root: ${currentRootVersion} (previous version unavailable)`;
@@ -704,16 +689,111 @@ function validatePublish(dryRun: boolean, autoTick: boolean) {
         hasError = true;
     }
 
-    if (hasError || (staleVersion && !autoTick)) {
-        console.error('\nFix the above issues before publishing.\n');
-        process.exit(1);
+    return {
+        currentRootVersion,
+        previousRootVersion,
+        rootPackageSuccessMessage,
+        hasError,
+        staleVersion,
+    };
+}
+
+function buildPackages(releaseOrder: string[], packageInfos: PackageInfos) {
+    for (const pkgName of releaseOrder) {
+        const pkgInfo = packageInfos[pkgName];
+        if (!pkgInfo.scripts?.build) continue;
+        const pkgDir = dirname(pkgInfo.packageJsonPath);
+        console.log(`\n🏗️  Building ${pkgName}...`);
+        try {
+            execSync('npm run build', {
+                cwd: pkgDir,
+                stdio: 'inherit',
+                env: { ...process.env, FORCE_COLOR: '1' },
+            });
+        } catch (error) {
+            console.error(`❌ Build failed for ${pkgName}:`, error);
+            process.exit(1);
+        }
+    }
+}
+
+function computeWorkspaceValidation(
+    dirtyVersionChanges: Map<
+        string,
+        {
+            oldVersion: string | null;
+            newVersion: string;
+            versionChanged: boolean;
+            versionIncremented: boolean;
+        }
+    >,
+    workspaces: ReturnType<typeof getWorkspaces>,
+    lastMonoRepoTag: string | null
+) {
+    let hasError = false;
+    let staleVersion = false;
+
+    for (const [
+        pkgName,
+        { oldVersion, newVersion, versionChanged, versionIncremented },
+    ] of dirtyVersionChanges.entries()) {
+        if (!semver.valid(newVersion)) {
+            console.error(
+                `❌ Package "${pkgName}" has invalid version: "${newVersion}"`
+            );
+            hasError = true;
+            continue;
+        }
+
+        if (!versionChanged) {
+            console.error(
+                `❌ Package "${pkgName}" was modified but version unchanged (${newVersion})`
+            );
+            staleVersion = true;
+            const ws = workspaces.find((w) => w.name === pkgName) as Workspace;
+            const changedFiles = lastMonoRepoTag
+                ? getChangesBetweenRefs(
+                      lastMonoRepoTag,
+                      'HEAD',
+                      [],
+                      ws.path,
+                      cwd
+                  )
+                : [];
+
+            const localChanges = git(['diff', '--name-only', ws.path], { cwd })
+                .stdout.trim()
+                .split('\n')
+                .filter(Boolean);
+
+            // Merge and deduplicate
+            const allChanges = Array.from(
+                new Set([...changedFiles, ...localChanges])
+            );
+
+            if (allChanges.length > 0) {
+                console.error(`   Changed files in "${pkgName}":`);
+                for (const file of allChanges) {
+                    console.error(`     - ${relative(ws.path, file)}`);
+                }
+            }
+            continue;
+        }
+
+        if (oldVersion && !versionIncremented) {
+            console.error(
+                `❌ Package "${pkgName}" version not incremented: ${oldVersion} -> ${newVersion}`
+            );
+            staleVersion = true;
+        }
     }
 
-    // Auto tick feature -----------------------------------------------------------------------------------------------
+    return { hasError, staleVersion };
+}
 
+function validatePublish(dryRun: boolean, autoTick: boolean) {
     // If we previously ran with dry_run mode and auto tick but this time we run in dry_run mode we may have unpushed commits due to the auto tick
     // in this case we need to push them otherwise verifyCleanGitStatus will fail
-
     if (!dryRun) {
         const upstreamResult = git(['rev-parse', '--abbrev-ref', '@{u}'], {
             cwd,
@@ -753,85 +833,162 @@ function validatePublish(dryRun: boolean, autoTick: boolean) {
         }
     }
 
-    // If we have stale versions we can use 'npm version patch --no-git-tag-version --force' to bump each individual one
-    // We should then commit them all and the root package lock
-    // In dry_run mode we should NOT push in normal mode we should.
+    const lastMonoRepoTag = getLastTag(cwd);
+    const workspaces = getWorkspaces(cwd);
+    const packageInfos = getPackageInfos(cwd);
+    const { dependencies } = createDependencyMap(packageInfos);
+    const inDegree = calculateWorkspaceInDegree(workspaces, dependencies);
+    const releaseOrderOriginal = getReleaseOrderFromInDegree(
+        inDegree,
+        dependencies
+    );
+    const dirtyMap = getDirtyMap(workspaces, lastMonoRepoTag, cwd);
+    const dirtyVersionChanges = getDirtyPackagesVersionChanges(
+        workspaces,
+        dirtyMap,
+        lastMonoRepoTag,
+        cwd
+    );
 
-    if (autoTick && staleVersion) {
-        console.log('\n🔧 Auto-ticking packages with stale versions...');
+    const releaseOrder = releaseOrderOriginal.filter((pkgName) => {
+        const ws = packageInfos[pkgName];
+        const isRoot = workspaces.some(
+            (w) => w.path === '.' && w.name === pkgName
+        );
+        const isPrivate = ws?.private;
+
+        if (!isRoot && isPrivate) {
+            console.log(`⚠️ Wont publish private workspace: ${pkgName}`);
+        }
+
+        return isRoot || !isPrivate;
+    });
+
+    console.log('🏗️  Building packages...');
+    buildPackages(releaseOrder, packageInfos);
+
+    console.log('\n#️⃣  Validating versions...\n');
+
+    const wsValidation = computeWorkspaceValidation(
+        dirtyVersionChanges,
+        workspaces,
+        lastMonoRepoTag
+    );
+
+    let hasError = wsValidation.hasError;
+    let staleVersion = wsValidation.staleVersion;
+
+    const rootValidation = validateRootVersionBlock(
+        lastMonoRepoTag,
+        cwd,
+        workspaces,
+        dirtyMap
+    );
+    let currentRootVersion = rootValidation.currentRootVersion;
+    let previousRootVersion = rootValidation.previousRootVersion;
+    let rootPackageSuccessMessage = rootValidation.rootPackageSuccessMessage;
+    hasError = hasError || rootValidation.hasError;
+    staleVersion = staleVersion || rootValidation.staleVersion;
+
+    if (hasError || (staleVersion && !autoTick)) {
+        console.error('\nFix the above issues before publishing.\n');
+        process.exit(1);
+    }
+
+    // ===== Check git status BEFORE auto-tick =====
+    console.log('\n🗃️  Validating git status...\n');
+
+    // Pass false for autoTick here since we haven't done it yet
+    const gitIsClean = verifyCleanGitStatus(
+        workspaces,
+        dirtyMap,
+        cwd,
+        dryRun,
+        false
+    );
+
+    if (!gitIsClean) {
+        if (autoTick && staleVersion) {
+            console.error(
+                '\n❌ Cannot proceed with auto-tick due to the issues above.'
+            );
+            console.error(
+                'Auto-tick requires a clean git state with all changes pushed to remote.\n'
+            );
+        }
+        process.exit(1);
+    }
+
+    const packagesNeedingTick = Array.from(
+        dirtyVersionChanges.entries()
+    ).filter(([_, info]) => !info.versionChanged);
+
+    if (autoTick && staleVersion && packagesNeedingTick.length > 0) {
+        console.log(
+            '\n🔧 Auto-tick requested; running auto-tick and rehydrate...'
+        );
 
         const filesToCommit: string[] = [];
 
-        // Auto-tick workspaces
-        for (const [pkgName, versionInfo] of dirtyVersionChanges.entries()) {
-            if (!versionInfo.versionChanged) {
+        for (const [pkgName, info] of dirtyVersionChanges.entries()) {
+            if (!info.versionChanged) {
                 const ws = workspaces.find(
                     (w) => w.name === pkgName
                 ) as Workspace;
                 const pkgDir = resolve(cwd, ws.path);
-
                 console.log(`⬆️ Auto-ticking ${pkgName}`);
-                execSync(`npm version patch --no-git-tag-version --force`, {
-                    cwd: pkgDir,
-                    stdio: 'inherit',
-                    env: { ...process.env, FORCE_COLOR: '1' },
-                });
-
-                const updatedPkg = JSON.parse(
-                    readFileSync(resolve(pkgDir, 'package.json'), 'utf8')
-                );
-                versionInfo.newVersion = updatedPkg.version;
-                versionInfo.versionChanged = true;
-                versionInfo.versionIncremented = true;
-
+                bumpPatchVersion(pkgDir);
                 filesToCommit.push(resolve(pkgDir, 'package.json'));
             }
         }
 
-        // Auto-tick root package
         const rootPkgPath = resolve(cwd, 'package.json');
         const rootLockFile = resolve(cwd, 'package-lock.json');
-
-        console.log(`⬆️ Auto-ticking root package`);
-        execSync(`npm version patch --no-git-tag-version --force`, {
-            cwd,
-            stdio: 'inherit',
-            env: { ...process.env, FORCE_COLOR: '1' },
-        });
+        console.log('⬆️ Auto-ticking root package');
+        bumpPatchVersion(cwd);
         filesToCommit.push(rootPkgPath);
         if (existsSync(rootLockFile)) filesToCommit.push(rootLockFile);
 
-        // Commit auto-ticked files locally
-        if (filesToCommit.length > 0) {
-            execSync(
-                `git add ${filesToCommit.map((f) => `"${f}"`).join(' ')}`,
-                { cwd, stdio: 'inherit' }
-            );
-            execSync(`git commit -m "CHORE: Auto tick stale versions"`, {
-                cwd,
-                stdio: 'inherit',
-            });
+        gitAddCommitPush(filesToCommit, cwd, dryRun);
 
-            if (!dryRun) {
-                console.log('⬆️ Pushing auto-ticked commits to remote...');
-                execSync(`git push`, { cwd, stdio: 'inherit' });
-            } else {
-                console.log(
-                    '[dry-run] ✅ Auto-tick committed locally; did not push'
-                );
-            }
+        recomputeDirtyVersionChangesAfterAutoTick(
+            workspaces,
+            dirtyMap,
+            lastMonoRepoTag,
+            cwd,
+            dirtyVersionChanges
+        );
+
+        try {
+            const rootPkg = readPackageJsonSync(resolve(cwd, 'package.json'));
+            if (rootPkg) currentRootVersion = rootPkg.version;
+        } catch {
+            /* ignore */
+        }
+
+        const rootValidationAfter = validateRootVersionBlock(
+            lastMonoRepoTag,
+            cwd,
+            workspaces,
+            dirtyMap
+        );
+        hasError = hasError || rootValidationAfter.hasError;
+        staleVersion = staleVersion && rootValidationAfter.staleVersion;
+        if (rootValidationAfter.rootPackageSuccessMessage) {
+            rootPackageSuccessMessage =
+                rootValidationAfter.rootPackageSuccessMessage;
+        }
+
+        console.log('\n🗃️  Re-validating git status after auto-tick...\n');
+        if (
+            !verifyCleanGitStatus(workspaces, dirtyMap, cwd, dryRun, autoTick)
+        ) {
+            process.exit(1);
         }
     }
 
-    console.log('\n🗃️  Validating git status...\n');
-
-    if (!verifyCleanGitStatus(workspaces, dirtyMap, cwd, dryRun, autoTick)) {
-        process.exit(1);
-    }
-
     console.log('📝 Publish summary:\n');
-
-    console.log(rootPackageSuccessMessage);
+    console.log(rootPackageSuccessMessage ?? `🌳 Root: ${currentRootVersion}`);
     console.log('');
 
     const packagesToRelease: string[] = [];
@@ -844,9 +1001,9 @@ function validatePublish(dryRun: boolean, autoTick: boolean) {
             packagesToRelease.push(pkgName);
             const ws = workspaces.find((w) => w.name === pkgName);
             if (!ws) continue;
-            const currentVersion = JSON.parse(
-                readFileSync(resolve(cwd, ws.path, 'package.json'), 'utf8')
-            ).version;
+            const currentVersion = readPackageJsonSync(
+                resolve(cwd, ws.path, 'package.json')
+            )?.version;
             console.log(`🆕 ${pkgName} @ ${currentVersion} (new)`);
         } else if (status === 'dirty' && versionInfo?.versionIncremented) {
             packagesToRelease.push(pkgName);
@@ -856,9 +1013,9 @@ function validatePublish(dryRun: boolean, autoTick: boolean) {
         } else {
             const ws = workspaces.find((w) => w.name === pkgName);
             if (!ws) continue;
-            const currentVersion = JSON.parse(
-                readFileSync(resolve(cwd, ws.path, 'package.json'), 'utf8')
-            ).version;
+            const currentVersion = readPackageJsonSync(
+                resolve(cwd, ws.path, 'package.json')
+            )?.version;
             console.log(`✔️ ${pkgName} @ ${currentVersion} (unchanged)`);
         }
     }
@@ -870,7 +1027,6 @@ function validatePublish(dryRun: boolean, autoTick: boolean) {
         currentRootVersion: currentRootVersion as string,
     };
 }
-
 function replaceWorkspaceDepsWithVersions(
     packageInfos: PackageInfos,
     packagesToUpdate: string[]
@@ -905,7 +1061,7 @@ function replaceWorkspaceDepsWithVersions(
         if (changed) {
             writeFileSync(
                 packageJsonPath,
-                JSON.stringify(packageJson, null, 4)
+                JSON.stringify(packageJson, null, 4) + '\n'
             );
         }
     }
@@ -922,7 +1078,10 @@ function restoreWorkspaceDepsToStar(
         const original = originals.get(pkgName);
         if (original) {
             const pkgInfo = packageInfos[pkgName];
-            writeFileSync(pkgInfo.packageJsonPath, original);
+            writeFileSync(
+                pkgInfo.packageJsonPath,
+                original.endsWith('\n') ? original : original + '\n'
+            );
             console.log(`♻️ Restored dependencies for ${pkgName}`);
         }
     }
