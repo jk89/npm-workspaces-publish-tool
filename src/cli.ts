@@ -19,8 +19,8 @@ import { execSync } from 'child_process';
 import { homedir } from 'os';
 
 type Workspace = ReturnType<typeof getWorkspaces>[number];
-type Dependencies = Set<string>;
 type DirtyStatus = 'new' | 'dirty' | 'unchanged';
+
 type WorkspaceIssue = {
     unstagedFiles: string[];
     stagedFiles: string[];
@@ -91,6 +91,12 @@ function getReleaseOrderFromInDegree(
     return order;
 }
 
+/**
+ * Get which workspaces have meaningful changes since last tag
+ * A workspace is "dirty" if:
+ * 1. Source files changed (non-package.json files), OR
+ * 2. package.json changed in ways OTHER than just version field
+ */
 function getDirtyMap(
     workspaces: ReturnType<typeof getWorkspaces>,
     lastTag: string | null,
@@ -102,22 +108,79 @@ function getDirtyMap(
         ? getChangesBetweenRefs(lastTag, 'HEAD', [], '', cwd)
         : [];
 
-    const changedFilesLocal = git(['diff', '--name-only', 'HEAD'], { cwd })
-        .stdout.trim()
-        .split('\n')
-        .filter(Boolean);
-
-    const changedFiles = [...changedFilesFromTag, ...changedFilesLocal];
-
     for (const ws of workspaces) {
-        const isNew = !lastTag;
-        const isDirty = changedFiles.some((f) =>
-            resolve(cwd, f).includes(ws.path)
-        );
-
-        if (isNew) {
+        if (!lastTag) {
             dirtyMap.set(ws.name, 'new');
-        } else if (isDirty) {
+            continue;
+        }
+
+        // Check for source file changes (non-package.json files)
+        const sourceFilesChanged = changedFilesFromTag.some((f) => {
+            const absoluteFilePath = resolve(cwd, f).replace(/\\/g, '/');
+            const absoluteWorkspacePath = resolve(cwd, ws.path).replace(
+                /\\/g,
+                '/'
+            );
+            const fileName = f.split('/').pop();
+
+            const isInWorkspace =
+                absoluteFilePath.startsWith(absoluteWorkspacePath + '/') ||
+                absoluteFilePath === absoluteWorkspacePath;
+            const isNotPackageJson =
+                fileName !== 'package.json' && fileName !== 'package-lock.json';
+
+            return isInWorkspace && isNotPackageJson;
+        });
+
+        // Check if package.json changed in meaningful ways (not just version)
+        let packageJsonMeaningfullyChanged = false;
+        const workspacePackageJsonPath = resolve(
+            cwd,
+            ws.path,
+            'package.json'
+        ).replace(/\\/g, '/');
+        const pkgJsonChanged = changedFilesFromTag.some((f) => {
+            const absoluteFilePath = resolve(cwd, f).replace(/\\/g, '/');
+            return absoluteFilePath === workspacePackageJsonPath;
+        });
+
+        if (pkgJsonChanged) {
+            // Compare package.json at tag vs now, ignoring version field
+            const relativeWsPath = relative(cwd, ws.path);
+            const previousPkgRaw = git(
+                ['show', `${lastTag}:${relativeWsPath}/package.json`],
+                { cwd }
+            );
+
+            if (previousPkgRaw.success) {
+                try {
+                    const previousPkg = JSON.parse(previousPkgRaw.stdout);
+                    const currentPkg = JSON.parse(
+                        readFileSync(workspacePackageJsonPath, 'utf8')
+                    );
+
+                    // Remove version field and compare
+                    const prevWithoutVersion = { ...previousPkg };
+                    const currWithoutVersion = { ...currentPkg };
+                    delete prevWithoutVersion.version;
+                    delete currWithoutVersion.version;
+
+                    if (
+                        JSON.stringify(prevWithoutVersion) !==
+                        JSON.stringify(currWithoutVersion)
+                    ) {
+                        packageJsonMeaningfullyChanged = true;
+                    }
+                } catch {
+                    // If we can't parse, assume it changed meaningfully
+                    packageJsonMeaningfullyChanged = true;
+                }
+            }
+        }
+
+        const isDirty = sourceFilesChanged || packageJsonMeaningfullyChanged;
+
+        if (isDirty) {
             dirtyMap.set(ws.name, 'dirty');
         } else {
             dirtyMap.set(ws.name, 'unchanged');
@@ -127,127 +190,7 @@ function getDirtyMap(
     return dirtyMap;
 }
 
-function getDirtyPackagesVersionChanges(
-    workspaces: ReturnType<typeof getWorkspaces>,
-    dirtyMap: Map<string, DirtyStatus>,
-    lastTag: string | null,
-    cwd: string
-): Map<
-    string,
-    {
-        oldVersion: string | null;
-        newVersion: string;
-        versionChanged: boolean;
-        versionIncremented: boolean;
-    }
-> {
-    const result = new Map<
-        string,
-        {
-            oldVersion: string | null;
-            newVersion: string;
-            versionChanged: boolean;
-            versionIncremented: boolean;
-        }
-    >();
-
-    if (!lastTag) {
-        for (const ws of workspaces) {
-            const status = dirtyMap.get(ws.name);
-            if (status !== 'dirty' && status !== 'new') continue;
-
-            const pkgPath = resolve(cwd, ws.path, 'package.json');
-            let currentPkg: PackageJson;
-            try {
-                currentPkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
-            } catch (err) {
-                throw new Error(
-                    `Failed to parse current package.json for package "${ws.name}" at path "${pkgPath}": ${err}`
-                );
-            }
-
-            const newVersion = currentPkg.version as string;
-            result.set(ws.name, {
-                oldVersion: null,
-                newVersion,
-                versionChanged: true,
-                versionIncremented: true,
-            });
-        }
-        return result;
-    }
-
-    for (const ws of workspaces) {
-        const status = dirtyMap.get(ws.name);
-        if (status !== 'dirty' && status !== 'new') continue;
-
-        const pkgPath = resolve(cwd, ws.path, 'package.json');
-
-        let currentPkg: PackageJson;
-        try {
-            currentPkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
-        } catch (err) {
-            throw new Error(
-                `Failed to parse current package.json for package "${ws.name}" at path "${pkgPath}": ${err}`
-            );
-        }
-
-        const newVersion = currentPkg.version as string;
-
-        if (status === 'new') {
-            result.set(ws.name, {
-                oldVersion: null,
-                newVersion,
-                versionChanged: true,
-                versionIncremented: true,
-            });
-            continue;
-        }
-
-        const relativeWsPath = relative(cwd, ws.path);
-
-        const previousPkgRaw = git(
-            ['show', `${lastTag}:${relativeWsPath}/package.json`],
-            {
-                cwd,
-            }
-        );
-
-        if (!previousPkgRaw.success) {
-            result.set(ws.name, {
-                oldVersion: null,
-                newVersion,
-                versionChanged: true,
-                versionIncremented: true,
-            });
-            continue;
-        }
-
-        let previousPkg: PackageJson;
-        try {
-            previousPkg = JSON.parse(previousPkgRaw.stdout);
-        } catch (err) {
-            throw new Error(
-                `Failed to parse package.json from git at tag "${lastTag}" for package "${ws.name}": ${err}`
-            );
-        }
-
-        const oldVersion = previousPkg.version as string;
-        const versionChanged = newVersion !== oldVersion;
-        const versionIncremented = semver.gt(newVersion, oldVersion);
-
-        result.set(ws.name, {
-            oldVersion,
-            newVersion,
-            versionChanged,
-            versionIncremented,
-        });
-    }
-
-    return result;
-}
-
-function checkForUnpushedCommits(cwd: string) {
+function checkForUnpushedCommits(cwd: string): boolean {
     const branchResult = git(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd });
     if (!branchResult.success) {
         console.error('ERROR: Could not determine current branch.');
@@ -256,20 +199,13 @@ function checkForUnpushedCommits(cwd: string) {
 
     const currentBranch = branchResult.stdout.trim();
     if (currentBranch === 'HEAD') {
-        console.error(
-            'ERROR: You are in detached HEAD state. Cannot check for unpushed commits.'
-        );
+        console.error('ERROR: You are in detached HEAD state.');
         return false;
     }
 
     const upstreamResult = git(['rev-parse', '--abbrev-ref', '@{u}'], { cwd });
     if (!upstreamResult.success) {
-        console.error(
-            `ERROR: Current branch '${currentBranch}' has no upstream set.`
-        );
-        console.error(
-            'Please set upstream with: git branch --set-upstream-to=origin/<branch>'
-        );
+        console.error(`ERROR: Branch '${currentBranch}' has no upstream.`);
         return false;
     }
 
@@ -277,39 +213,33 @@ function checkForUnpushedCommits(cwd: string) {
     const unpushed = git(['log', `${upstream}..HEAD`, '--oneline'], { cwd });
 
     if (unpushed.stdout.trim() !== '') {
-        console.error('ERROR: You have committed but unpushed changes:');
+        console.error('ERROR: You have unpushed commits:');
         console.error(unpushed.stdout);
-        console.error(
-            `Please push your changes to '${upstream}' before publishing.`
-        );
+        console.error(`Please push to '${upstream}' before publishing.`);
         return false;
     }
 
     return true;
 }
 
-function verifyCleanGitStatus(
-    workspaces: { name: string; path: string }[],
-    dirtyMap: Map<string, 'new' | 'dirty' | 'unchanged'>,
+/**
+ * Check git status for uncommitted changes
+ */
+function checkGitStatus(
+    workspaces: ReturnType<typeof getWorkspaces>,
+    dirtyMap: Map<string, DirtyStatus>,
     cwd: string,
     dryRun: boolean,
     autoTick: boolean
 ): boolean {
-    const changedFilesRaw = git(['diff', '--name-only', 'HEAD'], { cwd })
-        .stdout.trim()
-        .split('\n')
-        .filter(Boolean);
-
     const stagedFilesRaw = git(['diff', '--cached', '--name-only'], { cwd })
         .stdout.trim()
         .split('\n')
         .filter(Boolean);
-
     const unstagedFilesRaw = git(['diff', '--name-only'], { cwd })
         .stdout.trim()
         .split('\n')
         .filter(Boolean);
-
     const status = git(['status', '--porcelain'], { cwd })
         .stdout.trim()
         .split('\n')
@@ -318,8 +248,25 @@ function verifyCleanGitStatus(
         .filter((line) => line.startsWith('??'))
         .map((line) => line.slice(3));
 
-    const workspaceIssues = new Map<string, WorkspaceIssue>();
+    const stagedFiles = new Set(stagedFilesRaw);
+    const unstagedFiles = new Set(unstagedFilesRaw);
+    const changedFiles = new Set([...stagedFilesRaw, ...unstagedFilesRaw]);
 
+    function findWorkspaceForFile(filePath: string) {
+        const absoluteFilePath = resolve(cwd, filePath).replace(/\\/g, '/');
+        for (const ws of workspaces) {
+            const wsPathNormalized = resolve(cwd, ws.path).replace(/\\/g, '/');
+            if (
+                absoluteFilePath.startsWith(wsPathNormalized + '/') ||
+                absoluteFilePath === wsPathNormalized
+            ) {
+                return ws;
+            }
+        }
+        return undefined;
+    }
+
+    const workspaceIssues = new Map<string, WorkspaceIssue>();
     for (const ws of workspaces) {
         workspaceIssues.set(ws.name, {
             unstagedFiles: [],
@@ -328,38 +275,12 @@ function verifyCleanGitStatus(
         });
     }
 
-    function findWorkspaceForFile(filePath: string) {
-        const absoluteFilePath = resolve(cwd, filePath).replace(/\\/g, '/');
-
-        for (const ws of workspaces) {
-            const wsPathNormalized = resolve(cwd, ws.path)
-                .replace(/\\/g, '/')
-                .replace(/\/$/, '');
-
-            if (
-                absoluteFilePath === wsPathNormalized ||
-                absoluteFilePath.startsWith(wsPathNormalized + '/')
-            ) {
-                return ws;
-            }
-        }
-
-        return undefined;
-    }
-
-    const changedFiles = new Set(changedFilesRaw);
-    const stagedFiles = new Set(stagedFilesRaw);
-    const unstagedFiles = new Set(unstagedFilesRaw);
-
+    // Populate workspace issues - check ALL workspaces, not just dirty ones
     for (const filePath of changedFiles) {
         const ws = findWorkspaceForFile(filePath);
         if (!ws) continue;
 
-        const status = dirtyMap.get(ws.name);
-        if (status !== 'new' && status !== 'dirty') continue;
-
-        const issues = workspaceIssues.get(ws.name) as WorkspaceIssue;
-
+        const issues = workspaceIssues.get(ws.name)!;
         if (unstagedFiles.has(filePath)) {
             issues.unstagedFiles.push(filePath);
         } else if (stagedFiles.has(filePath)) {
@@ -370,130 +291,132 @@ function verifyCleanGitStatus(
     for (const filePath of untrackedFilesRaw) {
         const ws = findWorkspaceForFile(filePath);
         if (!ws) continue;
-        if (
-            dirtyMap.get(ws.name) !== 'new' &&
-            dirtyMap.get(ws.name) !== 'dirty'
-        )
-            continue;
-
-        (workspaceIssues.get(ws.name) as WorkspaceIssue).untrackedFiles.push(
-            filePath
-        );
+        workspaceIssues.get(ws.name)!.untrackedFiles.push(filePath);
     }
 
+    // Check for issues
     let hasCriticalIssues = false;
 
-    for (const [wsName, issues] of workspaceIssues.entries()) {
-        const { unstagedFiles, stagedFiles, untrackedFiles } = issues;
-        const status = dirtyMap.get(wsName);
+    // Check root package.json
+    if (changedFiles.has('package.json')) {
+        if (unstagedFiles.has('package.json')) {
+            console.error('❌ Root package.json has uncommitted changes\n');
+            hasCriticalIssues = true;
+        }
+        if (stagedFiles.has('package.json')) {
+            console.error('❌ Root package.json is staged but not committed\n');
+            hasCriticalIssues = true;
+        }
+    }
 
-        // Skip workspaces without issues
+    // Check ALL workspaces for uncommitted changes, not just dirty ones
+    for (const [wsName, issues] of workspaceIssues.entries()) {
         if (
-            unstagedFiles.length === 0 &&
-            stagedFiles.length === 0 &&
-            untrackedFiles.length === 0
+            issues.unstagedFiles.length === 0 &&
+            issues.stagedFiles.length === 0 &&
+            issues.untrackedFiles.length === 0
         ) {
             continue;
         }
 
-        let workspaceHasCriticalIssues = false;
-        const workspaceWarnings: string[] = [];
+        const wsStatus = dirtyMap.get(wsName);
+        let hasWorkspaceIssues = false;
 
-        if (unstagedFiles.length > 0) {
-            workspaceHasCriticalIssues = true;
+        if (issues.unstagedFiles.length > 0 || issues.stagedFiles.length > 0) {
+            hasWorkspaceIssues = true;
         }
 
-        if (stagedFiles.length > 0) {
-            workspaceHasCriticalIssues = true;
-        }
-
-        // Handle untracked files
-        if (untrackedFiles.length > 0) {
-            let hasCriticalUntracked = false;
-
-            for (const f of untrackedFiles) {
-                if (f.includes('package.json')) {
-                    hasCriticalUntracked = true;
-                }
-            }
-
-            if (status === 'new') {
-                // All untracked files are critical for new workspaces
-                workspaceHasCriticalIssues = true;
-            } else if (hasCriticalUntracked) {
-                // Untracked package.json is always critical
-                workspaceHasCriticalIssues = true;
-            } else if (status === 'dirty') {
-                // Non-package.json untracked files are warnings
-                workspaceWarnings.push(...untrackedFiles);
-            }
-        }
-
-        if (workspaceHasCriticalIssues) {
-            hasCriticalIssues = true;
-            console.error(
-                `Workspace '${wsName}' has critical issues preventing publish:`
+        if (issues.untrackedFiles.length > 0) {
+            const hasCriticalUntracked = issues.untrackedFiles.some((f) =>
+                f.includes('package.json')
             );
+            if (wsStatus === 'new' || hasCriticalUntracked) {
+                hasWorkspaceIssues = true;
+            }
+        }
 
-            if (unstagedFiles.length > 0) {
-                console.error('  ❌ Unstaged files:');
-                for (const f of unstagedFiles) {
+        if (hasWorkspaceIssues) {
+            hasCriticalIssues = true;
+
+            // Show appropriate header based on what issues exist
+            if (
+                issues.unstagedFiles.length > 0 &&
+                issues.stagedFiles.length === 0
+            ) {
+                console.error(
+                    `❌ Workspace '${wsName}' has uncommitted changes:`
+                );
+            } else if (
+                issues.stagedFiles.length > 0 &&
+                issues.unstagedFiles.length === 0
+            ) {
+                console.error(
+                    `❌ Workspace '${wsName}' is staged but not committed:`
+                );
+            } else {
+                console.error(
+                    `❌ Workspace '${wsName}' has uncommitted changes:`
+                );
+            }
+
+            if (issues.unstagedFiles.length > 0) {
+                console.error('  • Uncommitted files:');
+                for (const f of issues.unstagedFiles) {
                     console.error(`    - ${f}`);
                 }
             }
 
-            if (stagedFiles.length > 0) {
-                console.error('  ❌ Staged but uncommitted files:');
-                for (const f of stagedFiles) {
+            if (issues.stagedFiles.length > 0) {
+                console.error('  • Staged files:');
+                for (const f of issues.stagedFiles) {
                     console.error(`    - ${f}`);
                 }
             }
 
-            if (untrackedFiles.length > 0) {
-                console.error('  ❌ Critical untracked files:');
-                for (const f of untrackedFiles) {
-                    // Only show package.json files as critical
-                    if (f.includes('package.json')) {
-                        console.error(`    - ${f} (must be committed)`);
-                    } else if (status === 'new') {
-                        console.error(
-                            `    - ${f} (new workspace must commit all files)`
-                        );
+            if (issues.untrackedFiles.length > 0) {
+                const criticalUntracked = issues.untrackedFiles.filter(
+                    (f) => wsStatus === 'new' || f.includes('package.json')
+                );
+                if (criticalUntracked.length > 0) {
+                    console.error('  • Untracked files:');
+                    for (const f of criticalUntracked) {
+                        if (f.includes('package.json')) {
+                            console.error(`    - ${f} (must be tracked)`);
+                        } else {
+                            console.error(`    - ${f}`);
+                        }
                     }
                 }
             }
+            console.error('');
         }
+    }
 
-        // Show non-critical warnings
-        if (workspaceWarnings.length > 0) {
-            console.warn(`⚠️  Workspace '${wsName}' has non-critical issues:`);
-            console.warn(
-                '  Untracked files (allowed but should be in .gitignore):'
-            );
-            for (const f of workspaceWarnings) {
+    if (hasCriticalIssues) {
+        return false;
+    }
+
+    // Show warnings for non-critical untracked files
+    for (const [wsName, issues] of workspaceIssues.entries()) {
+        const wsStatus = dirtyMap.get(wsName);
+        const nonCriticalUntracked = issues.untrackedFiles.filter(
+            (f) => !f.includes('package.json') && wsStatus !== 'new'
+        );
+
+        if (nonCriticalUntracked.length > 0) {
+            console.warn(`\n⚠️  Workspace '${wsName}' has untracked files:`);
+            console.warn('  (Add to git or add to .gitignore)');
+            for (const f of nonCriticalUntracked) {
                 console.warn(`    - ${f}`);
             }
         }
     }
 
-    const rootPackageJsonPath = 'package.json';
-    if (changedFiles.has(rootPackageJsonPath)) {
-        if (unstagedFiles.has(rootPackageJsonPath)) {
-            console.error(
-                `❌ Root package.json has unstaged changes. Please stage or discard them.`
-            );
-            hasCriticalIssues = true;
-        }
-        if (stagedFiles.has(rootPackageJsonPath)) {
-            console.error(
-                `❌ Root package.json is staged but not committed. Please commit it.`
-            );
-            hasCriticalIssues = true;
-        }
+    if (hasCriticalIssues) {
+        return false;
     }
 
-    // Detect previous dry-run auto-tick commit
-    let allowPreviousDryRunAutoTick = false;
+    // Check for unpushed commits (with auto-tick exception)
     if (autoTick && dryRun) {
         const upstreamResult = git(['rev-parse', '--abbrev-ref', '@{u}'], {
             cwd,
@@ -509,35 +432,165 @@ function verifyCleanGitStatus(
                     .split('==END==')
                     .map((s) => s.trim())
                     .filter(Boolean);
-                const isAutoTick = (msg: string) =>
-                    msg.split('\n', 1)[0].trim() ===
-                    'CHORE: Auto tick stale versions';
-                allowPreviousDryRunAutoTick = msgs.some(isAutoTick);
+                const hasAutoTick = msgs.some(
+                    (msg) =>
+                        msg.split('\n')[0].trim() ===
+                        'CHORE: Auto tick stale versions'
+                );
+                if (hasAutoTick) {
+                    console.log(
+                        'ℹ️ Previous dry-run auto-tick detected; allowing unpushed commits\n'
+                    );
+                    return true;
+                }
             }
         }
     }
 
-    const noUnpushedCommits = checkForUnpushedCommits(cwd);
+    return checkForUnpushedCommits(cwd);
+}
 
-    if (allowPreviousDryRunAutoTick) {
-        console.log(
-            'ℹ️ Previous dry-run auto-tick commit detected (exactly "CHORE: Auto tick stale versions"); temporarily permitting unpushed commits—including any staged changes—to exist without failing validation because the next full-mode run will push them automatically. All other critical issues (untracked files, dirty workspaces, stale versions) are still enforced and will cause failure if violated.'
+/**
+ * Get version info for dirty workspaces
+ */
+function getVersionChanges(
+    workspaces: ReturnType<typeof getWorkspaces>,
+    dirtyMap: Map<string, DirtyStatus>,
+    lastTag: string | null,
+    cwd: string
+): Map<
+    string,
+    {
+        oldVersion: string | null;
+        newVersion: string;
+        versionChanged: boolean;
+        versionIncremented: boolean;
+    }
+> {
+    const versionChanges = new Map();
+
+    for (const ws of workspaces) {
+        const status = dirtyMap.get(ws.name);
+        if (status !== 'dirty' && status !== 'new') continue;
+
+        const pkgPath = resolve(cwd, ws.path, 'package.json');
+        const currentPkg = JSON.parse(
+            readFileSync(pkgPath, 'utf8')
+        ) as PackageJson;
+        const newVersion = currentPkg.version as string;
+
+        if (!semver.valid(newVersion)) {
+            throw new Error(`Invalid version "${newVersion}" in ${ws.name}`);
+        }
+
+        if (status === 'new' || !lastTag) {
+            versionChanges.set(ws.name, {
+                oldVersion: null,
+                newVersion,
+                versionChanged: true,
+                versionIncremented: true,
+            });
+            continue;
+        }
+
+        // Get old version from tag
+        const relativeWsPath = relative(cwd, ws.path);
+        const previousPkgRaw = git(
+            ['show', `${lastTag}:${relativeWsPath}/package.json`],
+            { cwd }
         );
+
+        let oldVersion: string | null = null;
+        if (previousPkgRaw.success) {
+            try {
+                const previousPkg = JSON.parse(
+                    previousPkgRaw.stdout
+                ) as PackageJson;
+                oldVersion = previousPkg.version as string;
+            } catch {
+                oldVersion = null;
+            }
+        }
+
+        const versionChanged = oldVersion === null || newVersion !== oldVersion;
+        const versionIncremented =
+            oldVersion !== null && semver.gt(newVersion, oldVersion);
+
+        versionChanges.set(ws.name, {
+            oldVersion,
+            newVersion,
+            versionChanged,
+            versionIncremented,
+        });
     }
 
-    if (hasCriticalIssues) {
-        console.error(
-            'Please commit or stash the above changes before publishing.'
-        );
-        return false;
+    return versionChanges;
+}
+
+function validateRootVersion(
+    lastTag: string | null,
+    cwd: string,
+    anyWorkspaceDirty: boolean
+): {
+    currentVersion: string;
+    previousVersion?: string;
+    needsTick: boolean;
+    message: string;
+} {
+    const rootPkgPath = resolve(cwd, 'package.json');
+    const rootPkg = JSON.parse(
+        readFileSync(rootPkgPath, 'utf8')
+    ) as PackageJson;
+    const currentVersion = rootPkg.version as string;
+
+    if (!semver.valid(currentVersion)) {
+        throw new Error(`Invalid root version: ${currentVersion}`);
     }
 
-    // Only check for unpushed commits if no dry-run auto-tick exists
-    if (!allowPreviousDryRunAutoTick) {
-        if (!noUnpushedCommits) return false;
+    if (!lastTag) {
+        return {
+            currentVersion,
+            needsTick: false,
+            message: `🌳 Root: ${currentVersion} (first release)`,
+        };
     }
 
-    return true;
+    const lastRootPkgRaw = git(['show', `${lastTag}:package.json`], { cwd });
+    if (!lastRootPkgRaw.success) {
+        return {
+            currentVersion,
+            needsTick: false,
+            message: `🌳 Root: ${currentVersion}`,
+        };
+    }
+
+    const lastRootPkg = JSON.parse(lastRootPkgRaw.stdout) as PackageJson;
+    const previousVersion = lastRootPkg.version as string;
+
+    if (!anyWorkspaceDirty) {
+        return {
+            currentVersion,
+            previousVersion,
+            needsTick: false,
+            message: `✔️ Root: ${currentVersion} (unchanged)`,
+        };
+    }
+
+    if (semver.gt(currentVersion, previousVersion)) {
+        return {
+            currentVersion,
+            previousVersion,
+            needsTick: false,
+            message: `🌳 Root: ${previousVersion} → ${currentVersion}`,
+        };
+    }
+
+    return {
+        currentVersion,
+        previousVersion,
+        needsTick: true,
+        message: `❌ Root: ${previousVersion} → ${currentVersion} (needs bump)`,
+    };
 }
 
 function readPackageJsonSync(path: string): PackageJson | null {
@@ -546,10 +599,6 @@ function readPackageJsonSync(path: string): PackageJson | null {
     } catch {
         return null;
     }
-}
-
-function writePackageJsonSync(path: string, pkg: PackageJson) {
-    writeFileSync(path, JSON.stringify(pkg, null, 4) + '\n', 'utf8');
 }
 
 function bumpPatchVersion(pkgDir: string) {
@@ -575,128 +624,6 @@ function gitAddCommitPush(files: string[], cwdArg: string, dryRun: boolean) {
     }
 }
 
-function recomputeDirtyVersionChangesAfterAutoTick(
-    workspaces: ReturnType<typeof getWorkspaces>,
-    dirtyMap: Map<string, DirtyStatus>,
-    lastMonoRepoTag: string | null,
-    cwdArg: string,
-    targetMap: Map<
-        string,
-        {
-            oldVersion: string | null;
-            newVersion: string;
-            versionChanged: boolean;
-            versionIncremented: boolean;
-        }
-    >
-) {
-    const refreshed = getDirtyPackagesVersionChanges(
-        workspaces,
-        dirtyMap,
-        lastMonoRepoTag,
-        cwdArg
-    );
-    targetMap.clear();
-    for (const [k, v] of refreshed.entries()) {
-        targetMap.set(k, v);
-    }
-}
-
-function validateRootVersionBlock(
-    lastMonoRepoTag: string | null,
-    cwdArg: string,
-    workspaces: ReturnType<typeof getWorkspaces>,
-    dirtyMap: Map<string, DirtyStatus>
-): {
-    currentRootVersion?: string;
-    previousRootVersion?: string;
-    rootPackageSuccessMessage?: string;
-    hasError: boolean;
-    staleVersion: boolean;
-} {
-    const rootPackageJsonPath = resolve(cwdArg, 'package.json');
-    let previousRootVersion: string | undefined;
-    let currentRootVersion: string | undefined;
-    let rootPackageSuccessMessage: string | undefined;
-    let hasError = false;
-    let staleVersion = false;
-
-    try {
-        const rootPackage = readPackageJsonSync(
-            rootPackageJsonPath
-        ) as PackageJson;
-        currentRootVersion = rootPackage?.version;
-
-        if (!semver.valid(currentRootVersion)) {
-            console.error(
-                `❌ Invalid root version in package.json: "${currentRootVersion}"`
-            );
-            hasError = true;
-        } else if (lastMonoRepoTag) {
-            const lastRootPackageRaw = git(
-                ['show', `${lastMonoRepoTag}:package.json`],
-                { cwd: cwdArg }
-            );
-            if (lastRootPackageRaw.success) {
-                try {
-                    const lastRootPackage = JSON.parse(
-                        lastRootPackageRaw.stdout
-                    ) as PackageJson;
-                    previousRootVersion = lastRootPackage.version as string;
-
-                    const anyWorkspaceDirty = workspaces.some(
-                        (ws) => dirtyMap.get(ws.name) !== 'unchanged'
-                    );
-
-                    if (
-                        !semver.gt(
-                            currentRootVersion as string,
-                            previousRootVersion
-                        )
-                    ) {
-                        if (
-                            workspaces.some(
-                                (ws) => dirtyMap.get(ws.name) !== 'unchanged'
-                            )
-                        ) {
-                            console.error(
-                                `❌ Root version not incremented: ${previousRootVersion} → ${currentRootVersion}`
-                            );
-                            staleVersion = true;
-                        } else {
-                            // nothing changed, so root is effectively unchanged
-                            rootPackageSuccessMessage = `✔️ Root: ${currentRootVersion} (unchanged)`;
-                        }
-                    } else {
-                        rootPackageSuccessMessage = `🌳 Root: ${previousRootVersion} → ${currentRootVersion}`;
-                    }
-                } catch {
-                    rootPackageSuccessMessage = `⚠️ Root: ${currentRootVersion} (previous version unavailable)`;
-                }
-            } else {
-                rootPackageSuccessMessage = `⚠️ Root: ${currentRootVersion} (previous version unavailable)`;
-            }
-        } else {
-            rootPackageSuccessMessage = `🌳 Root: ${currentRootVersion} (first release)`;
-        }
-    } catch (e) {
-        console.error(
-            `❌ Could not parse root package.json "${rootPackageJsonPath}"\n${String(
-                (e as Error).stack
-            )}`
-        );
-        hasError = true;
-    }
-
-    return {
-        currentRootVersion,
-        previousRootVersion,
-        rootPackageSuccessMessage,
-        hasError,
-        staleVersion,
-    };
-}
-
 function buildPackages(releaseOrder: string[], packageInfos: PackageInfos) {
     for (const pkgName of releaseOrder) {
         const pkgInfo = packageInfos[pkgName];
@@ -710,104 +637,20 @@ function buildPackages(releaseOrder: string[], packageInfos: PackageInfos) {
                 env: { ...process.env, FORCE_COLOR: '1' },
             });
         } catch (error) {
-            console.error(`❌ Build failed for ${pkgName}:`, error);
+            console.error(`❌ Build failed for ${pkgName}`);
             process.exit(1);
         }
     }
 }
 
-function computeWorkspaceValidation(
-    dirtyVersionChanges: Map<
-        string,
-        {
-            oldVersion: string | null;
-            newVersion: string;
-            versionChanged: boolean;
-            versionIncremented: boolean;
-        }
-    >,
-    workspaces: ReturnType<typeof getWorkspaces>,
-    lastMonoRepoTag: string | null
-) {
-    let hasError = false;
-    let staleVersion = false;
-
-    for (const [
-        pkgName,
-        { oldVersion, newVersion, versionChanged, versionIncremented },
-    ] of dirtyVersionChanges.entries()) {
-        if (!semver.valid(newVersion)) {
-            console.error(
-                `❌ Package "${pkgName}" has invalid version: "${newVersion}"`
-            );
-            hasError = true;
-            continue;
-        }
-
-        if (!versionChanged) {
-            console.error(
-                `❌ Package "${pkgName}" was modified but version unchanged (${newVersion})`
-            );
-            staleVersion = true;
-            const ws = workspaces.find((w) => w.name === pkgName) as Workspace;
-            const changedFiles = lastMonoRepoTag
-                ? getChangesBetweenRefs(
-                      lastMonoRepoTag,
-                      'HEAD',
-                      [],
-                      ws.path,
-                      cwd
-                  )
-                : [];
-
-            const localChanges = git(['diff', '--name-only', ws.path], { cwd })
-                .stdout.trim()
-                .split('\n')
-                .filter(Boolean);
-
-            const stagedChanges = git(
-                ['diff', '--cached', '--name-only', ws.path],
-                { cwd }
-            )
-                .stdout.trim()
-                .split('\n')
-                .filter(Boolean);
-
-            // Merge and deduplicate
-            const allChanges = Array.from(
-                new Set([...changedFiles, ...localChanges, ...stagedChanges])
-            );
-
-            if (allChanges.length > 0) {
-                console.error(`   Changed files in "${pkgName}":`);
-                for (const file of allChanges) {
-                    console.error(`     - ${relative(ws.path, file)}`);
-                }
-            }
-            continue;
-        }
-
-        if (oldVersion && !versionIncremented) {
-            console.error(
-                `❌ Package "${pkgName}" version not incremented: ${oldVersion} -> ${newVersion}`
-            );
-            staleVersion = true;
-        }
-    }
-
-    return { hasError, staleVersion };
-}
-
 function validatePublish(dryRun: boolean, autoTick: boolean) {
-    // If we previously ran with dry_run mode and auto tick but this time we run in dry_run mode we may have unpushed commits due to the auto tick
-    // in this case we need to push them otherwise verifyCleanGitStatus will fail
+    // Push any previous auto-tick commits if in full mode
     if (!dryRun) {
         const upstreamResult = git(['rev-parse', '--abbrev-ref', '@{u}'], {
             cwd,
         });
         if (upstreamResult.success) {
             const upstream = upstreamResult.stdout.trim();
-
             const unpushedRaw = git(
                 ['log', `${upstream}..HEAD`, '--pretty=%B%n==END=='],
                 { cwd }
@@ -817,213 +660,213 @@ function validatePublish(dryRun: boolean, autoTick: boolean) {
                     .split('==END==')
                     .map((s) => s.trim())
                     .filter(Boolean);
-
-                // Exact-match: first line must equal this string
-                const isAutoTick = (msg: string) =>
-                    msg.split('\n', 1)[0].trim() ===
-                    'CHORE: Auto tick stale versions';
-
-                // PUSH if *any* unpushed commit is an auto-tick commit
-                const allAutoTick = msgs.length > 0 && msgs.some(isAutoTick);
-
-                if (allAutoTick) {
-                    console.log(
-                        '⬆️ Found only auto-tick unpushed commit(s); pushing them to upstream...'
-                    );
+                const hasAutoTick = msgs.some(
+                    (msg) =>
+                        msg.split('\n')[0].trim() ===
+                        'CHORE: Auto tick stale versions'
+                );
+                if (hasAutoTick) {
+                    console.log('⬆️ Pushing previous auto-tick commits...\n');
                     execSync('git push', { cwd, stdio: 'inherit' });
-                } else {
-                    console.log(
-                        'ℹ️ Unpushed commits exist and are not all exact-match auto-tick; not pushing here.'
-                    );
                 }
             }
         }
     }
 
-    const lastMonoRepoTag = getLastTag(cwd);
+    const lastTag = getLastTag(cwd);
     const workspaces = getWorkspaces(cwd);
     const packageInfos = getPackageInfos(cwd);
     const { dependencies } = createDependencyMap(packageInfos);
     const inDegree = calculateWorkspaceInDegree(workspaces, dependencies);
-    const releaseOrderOriginal = getReleaseOrderFromInDegree(
-        inDegree,
-        dependencies
-    );
-    const dirtyMap = getDirtyMap(workspaces, lastMonoRepoTag, cwd);
-    const dirtyVersionChanges = getDirtyPackagesVersionChanges(
-        workspaces,
-        dirtyMap,
-        lastMonoRepoTag,
-        cwd
-    );
+    const releaseOrderAll = getReleaseOrderFromInDegree(inDegree, dependencies);
 
-    const releaseOrder = releaseOrderOriginal.filter((pkgName) => {
+    const releaseOrder = releaseOrderAll.filter((pkgName) => {
         const ws = packageInfos[pkgName];
         const isRoot = workspaces.some(
             (w) => w.path === '.' && w.name === pkgName
         );
-        const isPrivate = ws?.private;
-
-        if (!isRoot && isPrivate) {
-            console.log(`⚠️ Wont publish private workspace: ${pkgName}`);
+        if (!isRoot && ws?.private) {
+            console.log(`⚠️ Skipping private workspace: ${pkgName}`);
+            return false;
         }
-
-        return isRoot || !isPrivate;
+        return true;
     });
 
     console.log('🏗️  Building packages...');
     buildPackages(releaseOrder, packageInfos);
 
-    console.log('\n#️⃣  Validating versions...\n');
-
-    const wsValidation = computeWorkspaceValidation(
-        dirtyVersionChanges,
-        workspaces,
-        lastMonoRepoTag
-    );
-
-    let hasError = wsValidation.hasError;
-    let staleVersion = wsValidation.staleVersion;
-
-    const rootValidation = validateRootVersionBlock(
-        lastMonoRepoTag,
-        cwd,
-        workspaces,
-        dirtyMap
-    );
-    let currentRootVersion = rootValidation.currentRootVersion;
-    let previousRootVersion = rootValidation.previousRootVersion;
-    let rootPackageSuccessMessage = rootValidation.rootPackageSuccessMessage;
-    hasError = hasError || rootValidation.hasError;
-    staleVersion = staleVersion || rootValidation.staleVersion;
-
-    if (hasError || (staleVersion && !autoTick)) {
-        console.error('\nFix the above issues before publishing.\n');
-        process.exit(1);
-    }
-
-    // ===== Check git status BEFORE auto-tick =====
+    // Get dirty workspaces
     console.log('\n🗃️  Validating git status...\n');
+    const dirtyMap = getDirtyMap(workspaces, lastTag, cwd);
 
-    // Pass false for autoTick here since we haven't done it yet
-    const gitIsClean = verifyCleanGitStatus(
+    // Check git status
+    const gitClean = checkGitStatus(
         workspaces,
         dirtyMap,
         cwd,
         dryRun,
-        false
+        autoTick
     );
-
-    if (!gitIsClean) {
-        if (autoTick && staleVersion) {
-            console.error(
-                '\n❌ Cannot proceed with auto-tick due to the issues above.'
-            );
-            console.error(
-                'Auto-tick requires a clean git state with all changes pushed to remote.\n'
-            );
-        }
+    if (!gitClean) {
+        console.error(
+            '❌ Git issues detected. Commit/stash changes before publishing.\n'
+        );
         process.exit(1);
     }
 
-    const packagesNeedingTick = Array.from(
-        dirtyVersionChanges.entries()
-    ).filter(([_, info]) => !info.versionChanged);
+    console.log('✅ Git status is clean\n');
 
-    if (autoTick && staleVersion && packagesNeedingTick.length > 0) {
-        console.log(
-            '\n🔧 Auto-tick requested; running auto-tick and rehydrate...'
-        );
+    // Check versions
+    console.log('#️⃣  Validating versions...\n');
 
-        const filesToCommit: string[] = [];
+    const versionChanges = getVersionChanges(
+        workspaces,
+        dirtyMap,
+        lastTag,
+        cwd
+    );
+    const anyWorkspaceDirty = Array.from(dirtyMap.values()).some(
+        (s) => s !== 'unchanged'
+    );
+    const rootValidation = validateRootVersion(lastTag, cwd, anyWorkspaceDirty);
 
-        for (const [pkgName, info] of dirtyVersionChanges.entries()) {
-            if (!info.versionChanged) {
-                const ws = workspaces.find(
-                    (w) => w.name === pkgName
-                ) as Workspace;
-                const pkgDir = resolve(cwd, ws.path);
-                console.log(`⬆️ Auto-ticking ${pkgName}`);
-                bumpPatchVersion(pkgDir);
-                filesToCommit.push(resolve(pkgDir, 'package.json'));
+    let hasVersionIssues = false;
+    const packagesNeedingTick: string[] = [];
+
+    for (const [pkgName, info] of versionChanges.entries()) {
+        if (!info.versionChanged) {
+            const ws = workspaces.find((w) => w.name === pkgName);
+            const pkgJsonPath = ws
+                ? resolve(cwd, ws.path, 'package.json')
+                : null;
+            console.error(
+                `❌ ${pkgName}: version unchanged at ${info.newVersion} (needs increment)`
+            );
+            if (pkgJsonPath) {
+                console.error(`   Update version in: ${pkgJsonPath}`);
             }
-        }
-
-        const rootPkgPath = resolve(cwd, 'package.json');
-        const rootLockFile = resolve(cwd, 'package-lock.json');
-        console.log('⬆️ Auto-ticking root package');
-        bumpPatchVersion(cwd);
-        filesToCommit.push(rootPkgPath);
-        if (existsSync(rootLockFile)) filesToCommit.push(rootLockFile);
-
-        gitAddCommitPush(filesToCommit, cwd, dryRun);
-
-        recomputeDirtyVersionChangesAfterAutoTick(
-            workspaces,
-            dirtyMap,
-            lastMonoRepoTag,
-            cwd,
-            dirtyVersionChanges
-        );
-
-        try {
-            const rootPkg = readPackageJsonSync(resolve(cwd, 'package.json'));
-            if (rootPkg) currentRootVersion = rootPkg.version;
-        } catch {
-            /* ignore */
-        }
-
-        const rootValidationAfter = validateRootVersionBlock(
-            lastMonoRepoTag,
-            cwd,
-            workspaces,
-            dirtyMap
-        );
-        hasError = hasError || rootValidationAfter.hasError;
-        staleVersion = staleVersion && rootValidationAfter.staleVersion;
-        if (rootValidationAfter.rootPackageSuccessMessage) {
-            rootPackageSuccessMessage =
-                rootValidationAfter.rootPackageSuccessMessage;
-        }
-
-        console.log('\n🗃️  Re-validating git status after auto-tick...\n');
-        if (
-            !verifyCleanGitStatus(workspaces, dirtyMap, cwd, dryRun, autoTick)
-        ) {
-            process.exit(1);
+            hasVersionIssues = true;
+            packagesNeedingTick.push(pkgName);
+        } else if (!info.versionIncremented && info.oldVersion) {
+            const ws = workspaces.find((w) => w.name === pkgName);
+            const pkgJsonPath = ws
+                ? resolve(cwd, ws.path, 'package.json')
+                : null;
+            console.error(
+                `❌ ${pkgName}: version must be greater than ${info.oldVersion} (currently ${info.newVersion})`
+            );
+            if (pkgJsonPath) {
+                console.error(`   Update version in: ${pkgJsonPath}`);
+            }
+            hasVersionIssues = true;
+            packagesNeedingTick.push(pkgName);
         }
     }
 
+    if (rootValidation.needsTick) {
+        const rootPkgJsonPath = resolve(cwd, 'package.json');
+        console.error(
+            `❌ Root: version unchanged at ${rootValidation.currentVersion} (needs increment)`
+        );
+        console.error(`   Update version in: ${rootPkgJsonPath}`);
+        hasVersionIssues = true;
+    }
+
+    if (hasVersionIssues) {
+        console.error('');
+        if (!autoTick) {
+            console.error(
+                '❌ Use --auto-tick to fix automatically, or bump manually.\n'
+            );
+            process.exit(1);
+        }
+
+        // Auto-tick
+        console.log('🔧 Auto-tick requested; bumping versions...\n');
+        const filesToCommit: string[] = [];
+
+        for (const pkgName of Array.from(new Set(packagesNeedingTick))) {
+            const ws = workspaces.find((w) => w.name === pkgName);
+            if (!ws) continue;
+            const pkgDir = resolve(cwd, ws.path);
+            console.log(`⬆️ Auto-ticking ${pkgName}`);
+            bumpPatchVersion(pkgDir);
+            filesToCommit.push(resolve(pkgDir, 'package.json'));
+        }
+
+        if (rootValidation.needsTick) {
+            console.log('⬆️ Auto-ticking root package');
+            bumpPatchVersion(cwd);
+            filesToCommit.push(resolve(cwd, 'package.json'));
+            const lockFile = resolve(cwd, 'package-lock.json');
+            if (existsSync(lockFile)) filesToCommit.push(lockFile);
+        }
+
+        gitAddCommitPush(filesToCommit, cwd, dryRun);
+
+        // Re-validate
+        const newVersionChanges = getVersionChanges(
+            workspaces,
+            dirtyMap,
+            lastTag,
+            cwd
+        );
+        const newRootValidation = validateRootVersion(
+            lastTag,
+            cwd,
+            anyWorkspaceDirty
+        );
+
+        versionChanges.clear();
+        for (const [k, v] of newVersionChanges.entries()) {
+            versionChanges.set(k, v);
+        }
+
+        Object.assign(rootValidation, newRootValidation);
+
+        console.log('\n🗃️  Re-validating...\n');
+
+        // In dry-run mode, we allow the auto-tick commit to remain unpushed
+        if (!dryRun) {
+            if (!checkForUnpushedCommits(cwd)) {
+                process.exit(1);
+            }
+        } else {
+            console.log(
+                'ℹ️ Dry-run mode: auto-tick commit created but not pushed\n'
+            );
+        }
+    }
+
+    // Print publish summary
     console.log('📝 Publish summary:\n');
-    console.log(rootPackageSuccessMessage ?? `🌳 Root: ${currentRootVersion}`);
+    console.log(rootValidation.message);
     console.log('');
 
     const packagesToRelease: string[] = [];
 
     for (const pkgName of releaseOrder) {
         const status = dirtyMap.get(pkgName);
-        const versionInfo = dirtyVersionChanges.get(pkgName);
+        const versionInfo = versionChanges.get(pkgName);
 
         if (status === 'new') {
             packagesToRelease.push(pkgName);
-            const ws = workspaces.find((w) => w.name === pkgName);
-            if (!ws) continue;
-            const currentVersion = readPackageJsonSync(
-                resolve(cwd, ws.path, 'package.json')
-            )?.version;
-            console.log(`🆕 ${pkgName} @ ${currentVersion} (new)`);
-        } else if (status === 'dirty' && versionInfo?.versionIncremented) {
+            console.log(`🆕 ${pkgName} @ ${versionInfo?.newVersion} (new)`);
+        } else if (status === 'dirty') {
             packagesToRelease.push(pkgName);
-            console.log(
-                `⬆️ ${pkgName}: ${versionInfo.oldVersion} → ${versionInfo.newVersion}`
-            );
+            if (versionInfo) {
+                console.log(
+                    `⬆️ ${pkgName}: ${versionInfo.oldVersion} → ${versionInfo.newVersion}`
+                );
+            }
         } else {
             const ws = workspaces.find((w) => w.name === pkgName);
-            if (!ws) continue;
-            const currentVersion = readPackageJsonSync(
-                resolve(cwd, ws.path, 'package.json')
-            )?.version;
-            console.log(`✔️ ${pkgName} @ ${currentVersion} (unchanged)`);
+            if (ws) {
+                const version = readPackageJsonSync(
+                    resolve(cwd, ws.path, 'package.json')
+                )?.version;
+                console.log(`✔️ ${pkgName} @ ${version} (unchanged)`);
+            }
         }
     }
 
@@ -1031,9 +874,10 @@ function validatePublish(dryRun: boolean, autoTick: boolean) {
         releaseOrder,
         packageInfos,
         packagesToRelease,
-        currentRootVersion: currentRootVersion as string,
+        currentRootVersion: rootValidation.currentVersion,
     };
 }
+
 function replaceWorkspaceDepsWithVersions(
     packageInfos: PackageInfos,
     packagesToUpdate: string[]
@@ -1059,7 +903,7 @@ function replaceWorkspaceDepsWithVersions(
                     deps[depName] = newVersion;
                     changed = true;
                     console.log(
-                        `🆙 Updated ${pkgName}'s ${depType} for ${depName} to ${newVersion}`
+                        `🆙 ${pkgName}: ${depType}.${depName} → ${newVersion}`
                     );
                 }
             }
@@ -1089,7 +933,7 @@ function restoreWorkspaceDepsToStar(
                 pkgInfo.packageJsonPath,
                 original.endsWith('\n') ? original : original + '\n'
             );
-            console.log(`♻️ Restored dependencies for ${pkgName}`);
+            console.log(`♻️ Restored ${pkgName}`);
         }
     }
 }
@@ -1100,7 +944,6 @@ function runNpmPublishInReleaseOrder(
     packagesToRelease: string[],
     registryUrl?: string
 ) {
-    // Determine the registry flag to pass; fallback to ~/.npmrc if no explicit URL
     let registryFlag = '';
     if (registryUrl) {
         registryFlag = ` --registry=${registryUrl}`;
@@ -1110,8 +953,7 @@ function runNpmPublishInReleaseOrder(
             const lines = readFileSync(homeNpmrc, 'utf8').split(/\r?\n/);
             const line = lines.find((l) => l.trim().startsWith('registry='));
             if (line) {
-                const url = line.split('=')[1].trim();
-                registryFlag = ` --registry=${url}`;
+                registryFlag = ` --registry=${line.split('=')[1].trim()}`;
             }
         }
     }
@@ -1121,11 +963,7 @@ function runNpmPublishInReleaseOrder(
 
         const pkgInfo = packageInfos[packageName];
         const pkgDir = dirname(pkgInfo.packageJsonPath);
-        console.log(
-            `\n📦 Publishing ${packageName} from ${pkgDir} to ${
-                registryUrl || 'default registry'
-            }...`
-        );
+        console.log(`\n📦 Publishing ${packageName}...`);
 
         try {
             execSync(`npm publish${registryFlag}`, {
@@ -1133,9 +971,9 @@ function runNpmPublishInReleaseOrder(
                 stdio: 'inherit',
                 env: { ...process.env, FORCE_COLOR: '1' },
             });
-            console.log(`✅ Successfully published ${packageName}`);
+            console.log(`✅ ${packageName} published`);
         } catch (error) {
-            console.error(`❌ Failed to publish ${packageName}:`, error);
+            console.error(`❌ Failed to publish ${packageName}`);
             throw error;
         }
     }
@@ -1145,9 +983,9 @@ function tagAndPushRepo(version: string) {
     try {
         execSync(`git tag v${version}`, { stdio: 'inherit' });
         execSync(`git push origin v${version}`, { stdio: 'inherit' });
-        console.log(`✅ Tagged and pushed v${version}`);
+        console.log(`✅ Tagged v${version}`);
     } catch (err) {
-        console.error(`❌ Failed to tag or push v${version}:`, err);
+        console.error(`❌ Failed to tag v${version}`);
         process.exit(1);
     }
 }
@@ -1172,11 +1010,7 @@ program
     .description('Publish packages')
     .option('--dry-run', 'Run without making changes')
     .option('--registry <url>', 'NPM registry to publish to')
-    // add an option for --auto-tick which will automatically tick and push the package.json versions if they need it, but only push to remote if not in dry-run mode.
-    .option(
-        '--auto-tick',
-        'Automatically tick patch versions in the workspace/root package.json files if needed prior to a release'
-    )
+    .option('--auto-tick', 'Automatically tick patch versions if needed')
     .action((options) => {
         printHeader();
 
@@ -1192,23 +1026,21 @@ program
         } = validatePublish(dryRun, autoTick);
 
         if (packagesToRelease.length === 0) {
-            return console.log(' ￣\\_(ツ)_/￣ No workspaces to publish');
+            return console.log('\n￣\\_(ツ)_/￣ No workspaces to publish\n');
         }
 
         let originalPackageJsons: Map<string, string> | null = null;
 
         try {
             if (!dryRun) {
-                console.log(
-                    '\n🆙 Updating workspace dependencies to exact versions...'
-                );
+                console.log('\n🆙 Updating workspace dependencies...');
                 originalPackageJsons = replaceWorkspaceDepsWithVersions(
                     packageInfos,
                     packagesToRelease
                 );
             } else {
                 console.log(
-                    '\n[dry-run] 🆙 Would update workspace dependencies to exact versions'
+                    '\n[dry-run] 🆙 Would update workspace dependencies'
                 );
             }
 
@@ -1220,20 +1052,18 @@ program
                     packagesToRelease,
                     registryUrl
                 );
-                console.log('\n🎉 All packages published successfully!');
+                console.log('\n🎉 All packages published!\n');
                 console.log(
-                    `\n🏷️ Tagging repository with v${currentRootVersion}...`
+                    `🏷️ Tagging repository with v${currentRootVersion}...`
                 );
                 tagAndPushRepo(currentRootVersion);
             } else {
-                console.log('\n[dry-run] 📦 Would publish packages in order:');
-                packagesToRelease.forEach((pkg) => console.log(`- ${pkg}`));
-                console.log(
-                    `\n[dry-run] 🏷️  Would tag repository with v${currentRootVersion}...`
-                );
+                console.log('\n[dry-run] 📦 Would publish:');
+                packagesToRelease.forEach((pkg) => console.log(`  - ${pkg}`));
+                console.log(`\n[dry-run] 🏷️ Would tag: v${currentRootVersion}`);
             }
         } catch (error) {
-            console.error('\n ❌ Publishing failed:', error);
+            console.error('\n❌ Publishing failed:', error);
             process.exit(1);
         } finally {
             if (!dryRun && originalPackageJsons) {
@@ -1243,10 +1073,10 @@ program
                     packagesToRelease,
                     originalPackageJsons
                 );
-                console.log('♻️ Restoration complete.');
+                console.log('♻️ Restoration complete.\n');
             } else if (dryRun) {
                 console.log(
-                    '\n[dry-run] ♻️ Would restore workspace dependencies'
+                    '\n[dry-run] ♻️ Would restore workspace dependencies\n'
                 );
             }
         }
