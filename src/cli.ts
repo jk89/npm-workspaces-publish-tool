@@ -190,7 +190,7 @@ function getDirtyMap(
     return dirtyMap;
 }
 
-function checkForUnpushedCommits(cwd: string): boolean {
+function checkForUnpushedCommits(cwd: string, autoTick: boolean): boolean {
     const branchResult = git(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd });
     if (!branchResult.success) {
         console.error('ERROR: Could not determine current branch.');
@@ -205,6 +205,14 @@ function checkForUnpushedCommits(cwd: string): boolean {
 
     const upstreamResult = git(['rev-parse', '--abbrev-ref', '@{u}'], { cwd });
     if (!upstreamResult.success) {
+        // In auto-tick mode, branches without upstream are OK - we'll handle it during push
+        if (autoTick) {
+            console.log(
+                `ℹ️ Branch '${currentBranch}' has no upstream. Will set it during push.`
+            );
+            return true;
+        }
+        // In manual mode without auto-tick, require upstream to catch mistakes
         console.error(`ERROR: Branch '${currentBranch}' has no upstream.`);
         return false;
     }
@@ -447,7 +455,7 @@ function checkGitStatus(
         }
     }
 
-    return checkForUnpushedCommits(cwd);
+    return checkForUnpushedCommits(cwd, autoTick);
 }
 
 /**
@@ -609,7 +617,12 @@ function bumpPatchVersion(pkgDir: string) {
     });
 }
 
-function gitAddCommitPush(files: string[], cwdArg: string, dryRun: boolean) {
+function gitAddCommitPush(
+    files: string[],
+    cwdArg: string,
+    dryRun: boolean,
+    autoTick: boolean
+) {
     if (files.length === 0) return;
     execSync(`git add ${files.map((f) => `"${f}"`).join(' ')}`, {
         cwd: cwdArg,
@@ -620,7 +633,23 @@ function gitAddCommitPush(files: string[], cwdArg: string, dryRun: boolean) {
         stdio: 'inherit',
     });
     if (!dryRun) {
-        execSync(`git push`, { cwd: cwdArg, stdio: 'inherit' });
+        // In auto-tick mode, use -u origin <branch> to set upstream automatically
+        if (autoTick) {
+            const branchResult = git(['rev-parse', '--abbrev-ref', 'HEAD'], {
+                cwd: cwdArg,
+            });
+            if (branchResult.success) {
+                const currentBranch = branchResult.stdout.trim();
+                execSync(`git push -u origin ${currentBranch}`, {
+                    cwd: cwdArg,
+                    stdio: 'inherit',
+                });
+            } else {
+                execSync(`git push`, { cwd: cwdArg, stdio: 'inherit' });
+            }
+        } else {
+            execSync(`git push`, { cwd: cwdArg, stdio: 'inherit' });
+        }
     }
 }
 
@@ -802,7 +831,7 @@ function validatePublish(dryRun: boolean, autoTick: boolean) {
             if (existsSync(lockFile)) filesToCommit.push(lockFile);
         }
 
-        gitAddCommitPush(filesToCommit, cwd, dryRun);
+        gitAddCommitPush(filesToCommit, cwd, dryRun, autoTick);
 
         // Re-validate
         const newVersionChanges = getVersionChanges(
@@ -828,7 +857,7 @@ function validatePublish(dryRun: boolean, autoTick: boolean) {
 
         // In dry-run mode, we allow the auto-tick commit to remain unpushed
         if (!dryRun) {
-            if (!checkForUnpushedCommits(cwd)) {
+            if (!checkForUnpushedCommits(cwd, autoTick)) {
                 process.exit(1);
             }
         } else {
